@@ -1,33 +1,52 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import json
-import struct
 import logging
 from queue import Queue
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
 from functools import lru_cache
-from fontTools.ttLib import TTFont
-from blackrenderer.font import BlackRendererFont
-from blackrenderer.backends import getSurfaceClass
-from PIL import Image
-import uharfbuzz as hb_module
-import math
-import array
+import os
 
-HAS_SKIA = getSurfaceClass("skia") is not None
+# 导入新创建的模块
+from color_gradient import ColorGradient
+from position_animator import PositionAnimator
+from names_list_parser import NamesListParser
+from precomputed_values import PrecomputedValues
+from scaled_config import ScaledConfig
 
+# 导入工具函数
+from unicode_utils import (
+    load_unicode_blocks, find_block_name, find_block_index,
+    load_unicode_names, load_combining_marks, build_block_index_mapping,
+    get_utf8_encoding, get_utf16le_encoding, get_utf16be_encoding
+)
+
+from image_utils import (
+    fast_blend_colors, normalize_color, get_random_color, parse_color_list,
+    precompute_blend_colors, calculate_lines_needed, render_info_text_simple,
+    render_progress_bar, check_bounds_with_padding, truncate_text_to_width,render_vertical_progress_bar,
+    render_spinner_string_at_bottom)
+
+from font_utils import preload_middle_fonts, get_font_display_name
+
+from file_utils import (
+    write_batch, optimized_writer_thread_fn,
+    create_filename_mapping, parse_content_position
+)
 
 @dataclass
 class Config:
     unicode_file: Path = Path.cwd() / 'Unicode.txt'
     output_dir: Path = Path.cwd() / 'png'
     font_files: list[Path] = None
-    ctrl_font_file: Path = Path('resources/fonts/Ctrl-Ctrl.ttf')
-    bottom_font_file: Path = Path.cwd() / 'resources/fonts/PressStart2P-1.ttf'
+    ctrl_font_file: Path = Path('Ctrl-Ctrl.ttf')
+    bottom_font_file: Path = Path.cwd() / 'PressStartHan2P.ttf'
     music_file: Path = Path.cwd() / 'DUTM.m4a'
     middle_font_size: int = 512
     bottom_font_size: int = 19
@@ -349,282 +368,3 @@ def blend_colors(fg: tuple[int,int,int], bg: tuple[int,int,int], alpha: float) -
         int(fg[1] * alpha + bg[1] * inv_alpha),
         int(fg[2] * alpha + bg[2] * inv_alpha)
     )
-
-
-def get_bitmap_font_sizes(font_path: Path, target_size: int) -> tuple[int, int]:
-    """读取位图字体(CBDT/sbix)的可用尺寸，返回 (PPEM, 实际位图像素尺寸)"""
-    tt = TTFont(str(font_path))
-
-    if 'CBDT' in tt:
-        ppem = None
-        actual_size = None
-
-        if 'CBLC' in tt:
-            cblc = tt['CBLC']
-            if hasattr(cblc, 'strikes') and cblc.strikes:
-                strikes = cblc.strikes
-                for strike in strikes:
-                    if hasattr(strike, 'bitmapSizeTable'):
-                        bt = strike.bitmapSizeTable
-                        if hasattr(bt, 'ppemX') and bt.ppemX:
-                            ppem = int(bt.ppemX)
-                        break
-
-        cbdt = tt['CBDT']
-        if hasattr(cbdt, 'strikeData') and cbdt.strikeData:
-            strike_data = cbdt.strikeData[0]
-            for glyph_name, glyph_data in strike_data.items():
-                if hasattr(glyph_data, 'metrics'):
-                    metrics = glyph_data.metrics
-                    if hasattr(metrics, 'height'):
-                        actual_size = int(metrics.height)
-                    break
-
-        if ppem and actual_size:
-            tt.close()
-            return (ppem, actual_size)
-        if ppem:
-            tt.close()
-            return (ppem, ppem)
-        if actual_size:
-            tt.close()
-            return (actual_size, actual_size)
-
-    if 'sbix' in tt:
-        sbix = tt['sbix']
-        if hasattr(sbix, 'strikes') and sbix.strikes:
-            ppem = min(sbix.strikes.keys())
-            actual_size = None
-
-            for strike in sbix.strikes.values():
-                if hasattr(strike, 'glyphs'):
-                    for glyph_name, glyph_data in strike.glyphs.items():
-                        if hasattr(glyph_data, 'imageData') and glyph_data.imageData:
-                            try:
-                                data = glyph_data.imageData
-                                if len(data) >= 24:
-                                    actual_size = struct.unpack('>I', data[16:20])[0]
-                            except Exception:
-                                pass
-                            break
-                    break
-
-            if actual_size:
-                tt.close()
-                return (ppem, actual_size)
-            tt.close()
-            return (ppem, ppem)
-
-    if 'head' in tt:
-        upem = tt['head'].unitsPerEm
-        tt.close()
-        return (upem, upem)
-        
-    tt.close()
-
-    return (target_size, target_size)
-
-
-def has_colr_table(font_path: Path) -> bool:
-    """检查字体是否有 COLR 表（支持 COLRv0 和 COLRv1）"""
-    tt = TTFont(str(font_path))
-    has_colr = 'COLR' in tt
-    tt.close()
-    return has_colr
-
-
-def has_svg_table(font_path: Path) -> bool:
-    """检查字体是否有 SVG 表"""
-    tt = TTFont(str(font_path))
-    has_svg = 'SVG ' in tt
-    tt.close()
-    return has_svg
-
-
-def render_svg_glyph(
-    font_path: Path,
-    char: str,
-    font_size: int,
-    fg_color: tuple[int, int, int]
-) -> tuple[Image.Image, int] | None:
-    """使用 skia-python 渲染 SVG 彩色字形，返回 (PIL Image, baseline_offset)
-    baseline_offset: 从图像底部到字形基线的像素数
-    """
-    try:
-        import skia
-    except ImportError:
-        return None
-    
-    ttFont = TTFont(str(font_path))
-    
-    if 'SVG ' not in ttFont:
-        ttFont.close()
-        return None
-    
-    svg_table = ttFont['SVG ']
-    if not svg_table.docList:
-        ttFont.close()
-        return None
-    
-    char_code = ord(char)
-    
-    cmap = ttFont.getBestCmap()
-    if cmap is None:
-        ttFont.close()
-        return None
-    
-    glyph_name = cmap.get(char_code)
-    if glyph_name is None:
-        ttFont.close()
-        return None
-    
-    glyph_order = ttFont.getGlyphOrder()
-    try:
-        glyph_id = glyph_order.index(glyph_name)
-    except ValueError:
-        ttFont.close()
-        return None
-    
-    svg_doc = None
-    for doc in svg_table.docList:
-        if doc.startGlyphID <= glyph_id <= doc.endGlyphID:
-            svg_doc = doc
-            break
-    
-    if svg_doc is None:
-        ttFont.close()
-        return None
-    
-    svg_doc_str = svg_doc.data
-    
-    svg_doc_str = svg_doc_str.replace('<?xml version="1.0" encoding="UTF-8"?>', '', 1)
-    
-    unitsPerEm = ttFont['head'].unitsPerEm
-    ascent = ttFont['hhea'].ascent
-    descent = ttFont['hhea'].descent
-    scale = font_size / unitsPerEm
-    
-    svg_doc_str = svg_doc_str.encode('utf-8')
-    
-    stream = skia.MemoryStream.Make(svg_doc_str)
-    dom = skia.SVGDOM.MakeFromStream(stream)
-    if dom is None:
-        ttFont.close()
-        return None
-    
-    surface = skia.Surface.MakeRaster(skia.ImageInfo.MakeN32Premul(font_size + 4, font_size + 4))
-    canvas = surface.getCanvas()
-    
-    canvas.clear(0)
-    
-    svg_transform = skia.Matrix()
-    svg_transform.setScale(scale * 0.8, scale * 0.8)
-    svg_transform.postTranslate(0, font_size + 2 - int(950 * scale / 9.375) - 30)
-    canvas.setMatrix(svg_transform)
-    
-    dom.setContainerSize(skia.Size.Make(font_size, font_size))
-    dom.render(canvas)
-    
-    image = surface.makeImageSnapshot()
-    if image is None:
-        ttFont.close()
-        return None
-    
-    png_data = image.encodeToData(skia.EncodedImageFormat.kPNG, 100)
-    
-    from io import BytesIO
-    img = Image.open(BytesIO(png_data))
-    img = img.convert("RGBA")
-    
-    ttFont.close()
-    
-    baseline_offset = int(ascent * scale) + 2
-    
-    return (img, baseline_offset)
-
-
-def render_colr_glyph(
-    font_path: Path,
-    char: str,
-    font_size: int,
-    fg_color: tuple[int, int, int]
-) -> tuple[Image.Image, int] | None:
-    """使用 BlackRenderer 渲染 COLR 彩色字形，返回 (PIL Image, baseline_offset)
-    baseline_offset: 从图像底部到字形基线的像素数
-    """
-    if HAS_SKIA and has_colr_table(font_path):
-        surfaceClass = getSurfaceClass("skia")
-        if surfaceClass is None:
-            return None
-        
-        brFont = BlackRendererFont(str(font_path))
-        
-        if not brFont.colrV0Glyphs and not brFont.colrV1Glyphs:
-            return None
-        
-        glyph_names = brFont.glyphNames
-        
-        import uharfbuzz as hb_module
-        
-        buf = hb_module.Buffer()
-        buf.add_str(char)
-        buf.guess_segment_properties()
-        hb_module.shape(brFont.hbFont, buf)
-        
-        if not buf.glyph_infos:
-            return None
-        
-        glyph_info = buf.glyph_infos[0]
-        glyph_name = glyph_names[glyph_info.codepoint]
-        
-        bounds = brFont.getGlyphBounds(glyph_name)
-        if bounds is None:
-            return None
-        
-        x_min, y_min, x_max, y_max = bounds
-        glyph_width = x_max - x_min
-        glyph_height = y_max - y_min
-        
-        if glyph_width == 0 or glyph_height == 0:
-            return None
-        
-        scale = font_size / brFont.unitsPerEm
-        
-        canvas_width = int(glyph_width * scale) + 4
-        canvas_height = int(glyph_height * scale) + 4
-        baseline_offset = int(y_max * scale) + 2
-        
-        bounds_for_canvas = (0, -canvas_height, canvas_width, 0)
-        
-        surface = surfaceClass()
-        
-        try:
-            with surface.canvas(bounds_for_canvas) as canvas:
-                canvas.scale(scale)
-                canvas.translate(-x_min, -y_max)
-                palette = brFont.getPalette(0)
-                brFont.drawGlyph(glyph_name, canvas, palette=palette)
-        except Exception as e:
-            return None
-        
-        import tempfile
-        import os
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
-            temp_path = f.name
-        
-        surface.saveImage(temp_path)
-        
-        from io import BytesIO
-        with open(temp_path, 'rb') as f:
-            png_data = f.read()
-        os.unlink(temp_path)
-        
-        img = Image.open(BytesIO(png_data))
-        img = img.convert("RGBA")
-        
-        return (img, baseline_offset)
-    
-    if has_svg_table(font_path):
-        return render_svg_glyph(font_path, char, font_size, fg_color)
-    
-    return None

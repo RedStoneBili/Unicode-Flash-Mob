@@ -10,6 +10,7 @@ import random
 import colorsys
 import math
 import re
+import struct
 from pathlib import Path
 from threading import Thread
 from queue import Queue
@@ -20,447 +21,25 @@ from typing import Sequence, List, Tuple, Optional, Dict, Set
 sys.path.insert(0, os.path.dirname(__file__))
 
 from control_map import get_char, CTRLS
-from Module import Config, UnicodeEntry, ColorManager, load_unicode_entries, setup_logging
+from Module import (
+    Config, UnicodeEntry, ColorManager, load_unicode_entries, setup_logging,
+    # 新导入的模块
+    ColorGradient, PositionAnimator, NamesListParser, PrecomputedValues, ScaledConfig,
+    load_unicode_blocks, find_block_name, find_block_index, load_unicode_names,
+    load_combining_marks, build_block_index_mapping, get_utf8_encoding,
+    get_utf16le_encoding, get_utf16be_encoding, fast_blend_colors, normalize_color,
+    get_random_color, parse_color_list, precompute_blend_colors, calculate_lines_needed,
+    render_info_text_simple, render_vertical_progress_bar, render_spinner_string_at_bottom,
+    check_bounds_with_padding, truncate_text_to_width, preload_middle_fonts,
+    get_font_display_name, write_batch, optimized_writer_thread_fn,
+    create_filename_mapping, parse_content_position
+)
 
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
 Image.MAX_IMAGE_PIXELS = None
 
-def write_batch(batch: list):
-    """批量写入文件"""
-    for data, path in batch:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, 'wb') as f:
-                f.write(data)
-        except Exception as e:
-            logging.error(f"写入文件失败 {path}: {e}")
-
-def optimized_writer_thread_fn(queue: Queue):
-    """优化的写入线程，支持批量写入"""
-    batch = []
-    batch_size = 10
-
-    while True:
-        item = queue.get()
-        if item is None:
-            if batch:
-                write_batch(batch)
-            queue.task_done()
-            break
-
-        batch.append(item)
-        if len(batch) >= batch_size:
-            write_batch(batch)
-            batch.clear()
-
-        queue.task_done()
-
-class ColorGradient:
-    def __init__(self, key_colors: Optional[List[Tuple[int, int, int, int]]] = None,
-                 cycle_length: int = 225):
-        if key_colors is None:
-            self.key_colors = [
-                (255, 0, 0, 255),
-                (255, 127, 0, 255),
-                (255, 255, 0, 255),
-                (0, 255, 0, 255),
-                (0, 255, 255, 255),
-                (0, 0, 255, 255),
-                (127, 0, 255, 255)
-            ]
-        else:
-            self.key_colors = key_colors
-
-        self.cycle_length = cycle_length
-
-        if self.key_colors and len(self.key_colors) > 1:
-            self.extended_colors = self.key_colors + [self.key_colors[0]]
-        else:
-            self.extended_colors = self.key_colors
-
-    def get_gradient_color(self, position: float) -> Tuple[int, int, int, int]:
-        if not self.extended_colors or len(self.extended_colors) <= 1:
-            return (255, 255, 255, 255) if not self.extended_colors else self.extended_colors[0]
-
-        t = position / self.cycle_length
-        t = t % 1.0
-
-        segment = t * (len(self.key_colors) - 1)
-
-        idx1 = int(math.floor(segment))
-        idx2 = idx1 + 1
-
-        if idx1 < 0:
-            idx1 = 0
-        if idx2 >= len(self.extended_colors):
-            idx2 = len(self.extended_colors) - 1
-
-        if idx1 == idx2:
-            return self.extended_colors[idx1]
-
-        ratio = segment - idx1
-
-        color1 = self.extended_colors[idx1]
-        color2 = self.extended_colors[idx2]
-
-        r = int(color1[0] * (1 - ratio) + color2[0] * ratio)
-        g = int(color1[1] * (1 - ratio) + color2[1] * ratio)
-        b = int(color1[2] * (1 - ratio) + color2[2] * ratio)
-        a = int(color1[3] * (1 - ratio) + color2[3] * ratio)
-
-        return (r, g, b, a)
-
-    def get_smooth_gradient_color(self, position: float) -> Tuple[int, int, int, int]:
-        if not self.key_colors or len(self.key_colors) <= 1:
-            return (255, 255, 255, 255) if not self.key_colors else self.key_colors[0]
-
-        t = position / self.cycle_length
-        angle = t * 2 * math.pi
-        hue = (angle / (2 * math.pi)) % 1.0
-
-        saturation = 1.0
-        value = 1.0
-
-        rgb = colorsys.hsv_to_rgb(hue, saturation, value)
-
-        r = int(rgb[0] * 255)
-        g = int(rgb[1] * 255)
-        b = int(rgb[2] * 255)
-        a = 255
-
-        return (r, g, b, a)
-
-class PositionAnimator:
-    def __init__(self, total_images: int, animation_type: str = "smooth",
-                 amplitude: int = 50, speed: float = 0.1,
-                 movement_speed: float = None):
-        self.total_images = total_images
-        self.animation_type = animation_type
-        self.amplitude = amplitude
-        self.speed = (speed if movement_speed is None else movement_speed) * 0.01
-
-        self.phase_offsets = {
-            'code': random.random() * 2 * math.pi,
-            'name': random.random() * 2 * math.pi,
-            'block': random.random() * 2 * math.pi,
-            'font': random.random() * 2 * math.pi,
-            'content': random.random() * 2 * math.pi
-        }
-
-        self.frequency_offsets = {
-            'code': random.uniform(0.9, 1.1),
-            'name': random.uniform(0.9, 1.1),
-            'block': random.uniform(0.9, 1.1),
-            'font': random.uniform(0.9, 1.1),
-            'content': random.uniform(0.9, 1.1)
-        }
-
-    def get_position_offset(self, index: int, base_x: int, base_y: int,
-                            element_type: str = "text") -> Tuple[int, int]:
-        if self.animation_type == "none":
-            return (base_x, base_y)
-
-        phase_offset = self.phase_offsets.get(element_type, random.random() * 2 * math.pi)
-        frequency = self.frequency_offsets.get(element_type, 1.0)
-
-        t = index * self.speed * frequency + phase_offset
-
-        if self.animation_type == "smooth":
-            dx = int(math.sin(t) * self.amplitude)
-            dy = int(math.cos(t * 0.7) * self.amplitude * 0.8)
-        elif self.animation_type == "random_smooth":
-            dx = int(math.sin(t * 1.3) * self.amplitude * 0.5 +
-                     math.cos(t * 0.5) * self.amplitude * 0.3 +
-                     math.sin(t * 0.2) * self.amplitude * 0.2)
-            dy = int(math.cos(t * 0.9) * self.amplitude * 0.4 +
-                     math.sin(t * 0.3) * self.amplitude * 0.4 +
-                     math.cos(t * 0.1) * self.amplitude * 0.2)
-        else:
-            dx = 0
-            dy = 0
-
-        max_offset = self.amplitude * 2
-        dx = max(-max_offset, min(max_offset, dx))
-        dy = max(-max_offset, min(max_offset, dy))
-
-        return (base_x + dx, base_y + dy)
-
-class NamesListParser:
-    def __init__(self, path: Path):
-        self.path = path
-        self.entries: Dict[str, List[str]] = {}
-        self._parse_file()
-
-    def _parse_file(self):
-        if not self.path.exists():
-            logging.warning(f"NamesList.txt 未找到: {self.path}")
-            return
-
-        current_code = None
-        current_lines = []
-
-        try:
-            content = self.path.read_text(encoding='utf-8')
-            lines = content.splitlines()
-
-            for line in lines:
-                line = line.rstrip('\n')
-
-                if len(line) >= 4 and line[0:4].isalnum():
-                    if current_code and current_lines:
-                        self.entries[current_code] = current_lines
-
-                    parts = line.split('\t', 1)
-                    if len(parts) > 0:
-                        current_code = parts[0].strip().upper()
-                        current_lines = [line]
-                elif current_code is not None:
-                    current_lines.append(line)
-
-            if current_code and current_lines:
-                self.entries[current_code] = current_lines
-
-            logging.info(f"加载 NamesList.txt: {len(self.entries)} 个条目")
-
-        except Exception as e:
-            logging.error(f"解析 NamesList.txt 失败: {e}")
-
-    def get_info_for_code(self, code_str: str) -> List[str]:
-        if code_str.startswith("U+"):
-            hex_code = code_str[2:].upper().zfill(4)
-        else:
-            hex_code = code_str.upper().zfill(4)
-
-        return self.entries.get(hex_code, [])
-
-class PrecomputedValues:
-    """预计算常用值以避免重复计算"""
-    def __init__(self, cfg: Config):
-        self.W, self.H = cfg.image_size
-        self.center_x = self.W // 2
-        self.center_y = self.H // 2
-        self.bottom_text_y = cfg.image_size[1] - cfg.bottom_font_size - 125
-        self.baseline_offset = cfg.text_position[1]
-        self.text_x_offset = cfg.text_position[0]
-        self.alpha = cfg.middle_font_color[3] / 255
-        self.fg_color = tuple(int(c) for c in cfg.middle_font_color[:3])
-        self.overlay_alpha = self.alpha * 0.5
-
-        self.padding = 20
-        self.top_left = (self.padding, self.padding)
-        self.top_y = self.padding
-        self.block_name_y = self.H - cfg.bottom_font_size * 2 - self.padding
-        self.block_name_pos = (self.padding, self.block_name_y)
-        self.font_name_y = self.H - cfg.bottom_font_size - self.padding
-        self.font_name_pos = (self.padding, self.font_name_y)
-
-        self.info_right_margin = self.padding
-        self.info_bottom_margin = self.padding
-        self.info_line_height = cfg.bottom_font_size + 2
-        self.info_max_width = self.W // 3
-
-        self.info_bottom_y = self.font_name_y + cfg.bottom_font_size
-
-def fast_blend_colors(fg: Sequence[int], bg: Sequence[int], alpha: float) -> tuple[int, int, int]:
-    """计算前景色与背景色的叠加结果"""
-    inv_alpha = 1.0 - alpha
-    return (
-        int(fg[0] * alpha + bg[0] * inv_alpha),
-        int(fg[1] * alpha + bg[1] * inv_alpha),
-        int(fg[2] * alpha + bg[2] * inv_alpha)
-    )
-
-def normalize_color(color) -> tuple[int, int, int, int]:
-    """标准化颜色格式，确保返回 RGBA 元组"""
-    if isinstance(color, int):
-        c = int(color)
-        return (c, c, c, 255)
-    elif isinstance(color, (list, tuple)):
-        if len(color) == 3:
-            return (int(color[0]), int(color[1]), int(color[2]), 255)
-        elif len(color) == 4:
-            return (int(color[0]), int(color[1]), int(color[2]), int(color[3]))
-        else:
-            raise ValueError(f"无效的颜色格式: {color}")
-    else:
-        raise ValueError(f"不支持的颜色类型: {type(color)}")
-
-def get_random_color() -> tuple[int, int, int, int]:
-    return (
-        random.randint(0, 255),
-        random.randint(0, 255),
-        random.randint(0, 255),
-        255
-    )
-
-def precompute_blend_colors(cfg: Config, bg_colors: list) -> tuple[dict, dict]:
-    """预计算所有可能的混合颜色"""
-    alpha = cfg.middle_font_color[3] / 255
-    fg = tuple(int(c) for c in cfg.middle_font_color[:3])
-    overlay_alpha = alpha * 0.5
-
-    blend_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-    overlay_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-
-    for bg_color in bg_colors:
-        normalized_bg = normalize_color(bg_color)
-        key = (int(normalized_bg[0]), int(normalized_bg[1]), int(normalized_bg[2]))
-
-        blend_cache[key] = fast_blend_colors(fg, key, alpha)
-        overlay_cache[key] = fast_blend_colors(fg, key, overlay_alpha)
-
-    return blend_cache, overlay_cache
-
-def parse_color_list(color_str: str) -> List[Tuple[int, int, int, int]]:
-    colors = []
-    if not color_str:
-        return colors
-
-    for color_part in color_str.split(';'):
-        parts = color_part.split(',')
-        if len(parts) >= 3:
-            r = int(parts[0].strip())
-            g = int(parts[1].strip())
-            b = int(parts[2].strip())
-            a = int(parts[3].strip()) if len(parts) >= 4 else 255
-            colors.append((r, g, b, a))
-
-    return colors
-
-def load_unicode_blocks(path: Path) -> list[tuple[int, int, str]]:
-    blocks: list[tuple[int, int, str]] = []
-    try:
-        text = path.read_text(encoding='utf-8')
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if ';' not in line:
-                continue
-            range_part, name = line.split(';', 1)
-            name = name.strip()
-            if '..' not in range_part:
-                continue
-            start_s, end_s = range_part.split('..', 1)
-            try:
-                start = int(start_s, 16)
-                end = int(end_s, 16)
-                blocks.append((start, end, name))
-            except Exception:
-                continue
-    except Exception:
-        return []
-    blocks.sort(key=lambda x: x[0])
-    return blocks
-
-def find_block_name(cp: int, blocks: list[tuple[int, int, str]]) -> str:
-    for start, end, name in blocks:
-        if start <= cp <= end:
-            return name
-    return 'No_Block'
-
-def preload_middle_fonts(entries: list[UnicodeEntry], cfg: Config) -> tuple[dict, dict]:
-    """预加载字体和度量信息"""
-    paths = {entry.font_path for entry in entries}
-    paths.update(cfg.font_files)
-
-    font_cache: dict[Path, ImageFont.FreeTypeFont | None] = {}
-    metrics_cache: dict[Path, tuple[int, int]] = {}
-
-    for p in paths:
-        try:
-            font = ImageFont.truetype(str(p), cfg.middle_font_size)
-            font_cache[p] = font
-            metrics_cache[p] = font.getmetrics()
-        except Exception as e:
-            logging.warning(f"预加载字体失败 `{p}`: {e}")
-            font_cache[p] = None
-
-    return font_cache, metrics_cache
-
-def load_unicode_names(path: Path) -> dict[int, str]:
-    names: dict[int, str] = {}
-    try:
-        text = path.read_text(encoding='utf-8')
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split(';')
-            if len(parts) < 2:
-                continue
-            try:
-                cp = int(parts[0], 16)
-            except Exception:
-                continue
-            name = parts[1].strip()
-            names[cp] = name
-    except Exception:
-        return {}
-    return names
-
-def calculate_lines_needed(text: str, max_width: int, font: ImageFont.FreeTypeFont) -> int:
-    temp_img = Image.new('RGBA', (100, 100), (0, 0, 0, 0))
-    temp_draw = ImageDraw.Draw(temp_img)
-
-    words = text.split()
-    current_line_width = 0
-    lines = 1
-
-    for word in words:
-        bbox = temp_draw.textbbox((0, 0), word + ' ', font=font)
-        word_width = bbox[2] - bbox[0]
-
-        if current_line_width + word_width > max_width:
-            lines += 1
-            current_line_width = word_width
-        else:
-            current_line_width += word_width
-
-    return lines
-
-def render_info_text_simple(
-        draw: ImageDraw.Draw,
-        text: str,
-        start_x: int,
-        start_y: int,
-        max_width: int,
-        line_height: int,
-        base_font: ImageFont.FreeTypeFont,
-        fg_color: Tuple[int, int, int]
-) -> int:
-    x = start_x
-    y = start_y
-
-    words = text.split()
-    for word in words:
-        word_with_space = word + ' '
-        bbox = draw.textbbox((0, 0), word_with_space, font=base_font)
-        word_width = bbox[2] - bbox[0]
-
-        if x + word_width > start_x + max_width:
-            x = start_x
-            y += line_height
-
-        draw.text((x, y), word_with_space, font=base_font, fill=fg_color)
-        x += word_width
-
-    return y
-
-def check_bounds_with_padding(x: int, y: int, width: int, height: int,
-                              padding: int, canvas_width: int, canvas_height: int) -> Tuple[int, int]:
-    if x + width > canvas_width - padding:
-        x = canvas_width - padding - width
-    if x < padding:
-        x = padding
-    if y + height > canvas_height - padding:
-        y = canvas_height - padding - height
-    if y < padding:
-        y = padding
-
-    return x, y
 
 def generate_image_bytes(
         entry: UnicodeEntry,
@@ -492,6 +71,20 @@ def generate_image_bytes(
         content_position_fixed: Optional[Tuple[int, int]] = None,
         show_names_info: bool = False,
         use_smooth_gradient: bool = True,
+        show_encoding: bool = False,
+        show_block_position: bool = False,
+        show_global_position: bool = False,
+        show_block_progress_bar: bool = False,
+        show_global_progress_bar: bool = False,
+        show_side_spinner: bool = False,
+        spinner_step: int = 0,
+        spinner_strings: List[str] = None,
+        global_index: int = 0,
+        total_entries: int = 0,
+        total_in_block: int = 0,
+        index_in_block: int = 0,
+        # 缩放因子
+        scale_factor: float = 1.0,
 ) -> tuple[bytes, Path, str | None]:
     """图片生成函数"""
     try:
@@ -578,6 +171,8 @@ def generate_image_bytes(
         bbox = draw.textbbox((0, 0), char, font=middle_font)
         w = bbox[2] - bbox[0]
         h = bbox[3] - bbox[1]
+        w = max(1, w)
+        h = max(1, h)
         text_cache[cache_key] = (int(w), int(h))
 
     x = (precomputed.W - w) // 2 + final_text_x_offset
@@ -605,6 +200,8 @@ def generate_image_bytes(
             obbox = draw.textbbox((0, 0), overlay_char, font=ctrl_font)
             ow = obbox[2] - obbox[0]
             oh = obbox[3] - obbox[1]
+            ow = max(1, ow)
+            oh = max(1, oh)
             overlay_bbox_cache[overlay_cache_key] = (int(ow), int(oh))
 
         if bg_key in overlay_cache:
@@ -621,12 +218,15 @@ def generate_image_bytes(
 
     draw.text((x, y), char, font=middle_font, fill=blended)
 
+    # 左上角：码位
     code_text = entry.code_str
     top_left_x, top_left_y = precomputed.top_left
 
     code_bbox = draw.textbbox((0, 0), code_text, font=bottom_font)
     code_w = code_bbox[2] - code_bbox[0]
     code_h = code_bbox[3] - code_bbox[1]
+    code_w = max(1, code_w)
+    code_h = max(1, code_h)
 
     if position_animator and animated_elements and 'code' in animated_elements:
         top_left_x, top_left_y = position_animator.get_position_offset(
@@ -640,6 +240,18 @@ def generate_image_bytes(
 
     draw.text((top_left_x, top_left_y), code_text, font=bottom_font, fill=blended)
 
+    # 左上角第二行：全局位置 [n/m]
+    if show_global_position and total_entries > 0:
+        global_position_text = f"{global_index + 1}/{total_entries}"
+        global_position_y = top_left_y + code_h + precomputed.line_spacing
+
+        if position_animator and animated_elements and 'code' in animated_elements:
+            global_position_y += position_animator.get_position_offset(gradient_index, 0, 0, 'code')[1]
+
+        if global_position_y + code_h < precomputed.H - precomputed.padding:
+            draw.text((top_left_x, global_position_y), global_position_text, font=bottom_font, fill=blended)
+
+    # 右上角：字符名称
     name_text = ''
     if unicode_names and cp in unicode_names:
         name_text = unicode_names[cp]
@@ -650,7 +262,9 @@ def generate_image_bytes(
         name_bbox = draw.textbbox((0, 0), name_text, font=bottom_font)
         name_w = name_bbox[2] - name_bbox[0]
         name_h = name_bbox[3] - name_bbox[1]
-        name_x = precomputed.W - name_w - precomputed.padding
+        name_w = max(1, name_w)
+        name_h = max(1, name_h)
+        name_x = precomputed.top_right_x - name_w
         name_y = precomputed.top_y
 
         if position_animator and animated_elements and 'name' in animated_elements:
@@ -665,12 +279,84 @@ def generate_image_bytes(
 
         draw.text((name_x, name_y), name_text, font=bottom_font, fill=blended)
 
+        # 右上角第二行：区块位置 [n/m]
+        if show_block_position and total_in_block > 0 and index_in_block > 0:
+            block_position_text = f"{index_in_block}/{total_in_block}"
+
+            block_pos_bbox = draw.textbbox((0, 0), block_position_text, font=bottom_font)
+            block_pos_w = block_pos_bbox[2] - block_pos_bbox[0]
+            block_pos_h = block_pos_bbox[3] - block_pos_bbox[1]
+
+            block_pos_x = precomputed.top_right_x - block_pos_w
+            block_pos_y = name_y + name_h + precomputed.line_spacing
+
+            if position_animator and animated_elements and 'name' in animated_elements:
+                block_pos_y += position_animator.get_position_offset(gradient_index, 0, 0, 'name')[1]
+
+            if block_pos_y + block_pos_h < precomputed.H - precomputed.padding and block_pos_x >= precomputed.padding:
+                draw.text((block_pos_x, block_pos_y), block_position_text, font=bottom_font, fill=blended)
+
+    # 正上方：编码信息
+    if show_encoding:
+        utf8_text = f"UTF-8: {get_utf8_encoding(cp)}"
+        utf16le_text = f"UTF-16LE: {get_utf16le_encoding(cp)}"
+        utf16be_text = f"UTF-16BE: {get_utf16be_encoding(cp)}"
+
+        encoding_y = precomputed.encoding_y
+
+        utf8_bbox = draw.textbbox((0, 0), utf8_text, font=bottom_font)
+        utf16le_bbox = draw.textbbox((0, 0), utf16le_text, font=bottom_font)
+        utf16be_bbox = draw.textbbox((0, 0), utf16be_text, font=bottom_font)
+
+        max_width = max(
+            utf8_bbox[2] - utf8_bbox[0],
+            utf16le_bbox[2] - utf16le_bbox[0],
+            utf16be_bbox[2] - utf16be_bbox[0]
+        )
+
+        encoding_x = (precomputed.W - max_width) // 2
+        total_height = precomputed.encoding_line_height * 3
+
+        if encoding_y + total_height < precomputed.center_y - precomputed.middle_font_size:
+            draw.text((encoding_x, encoding_y), utf8_text, font=bottom_font, fill=blended)
+            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height), utf16le_text, font=bottom_font,
+                      fill=blended)
+            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height * 2), utf16be_text, font=bottom_font,
+                      fill=blended)
+
+    # 底部左侧信息
+    font_file_name = get_font_display_name(font_path_key, cfg)
+    max_w = precomputed.W // 3
+    fname = truncate_text_to_width(draw, font_file_name, max_w, bottom_font)
+
+    # 字体名位置
+    font_name_x, font_name_y = precomputed.font_name_pos
+    if position_animator and animated_elements and 'font' in animated_elements:
+        font_name_x, font_name_y = position_animator.get_position_offset(
+            gradient_index, font_name_x, font_name_y, 'font'
+        )
+
+    fname_bbox = draw.textbbox((0, 0), fname, font=bottom_font)
+    fname_w = fname_bbox[2] - fname_bbox[0]
+    fname_h = fname_bbox[3] - fname_bbox[1]
+    fname_w = max(1, fname_w)
+    fname_h = max(1, fname_h)
+
+    font_name_x, font_name_y = check_bounds_with_padding(
+        font_name_x, font_name_y, fname_w, fname_h,
+        precomputed.padding, precomputed.W, precomputed.H
+    )
+    draw.text((font_name_x, font_name_y), fname, font=bottom_font, fill=blended)
+
+    # 区块名位置
     block_name = find_block_name(cp, blocks) if blocks else 'No_Block'
     block_name_x, block_name_y = precomputed.block_name_pos
 
     block_bbox = draw.textbbox((0, 0), block_name, font=bottom_font)
     block_w = block_bbox[2] - block_bbox[0]
     block_h = block_bbox[3] - block_bbox[1]
+    block_w = max(1, block_w)
+    block_h = max(1, block_h)
 
     if position_animator and animated_elements and 'block' in animated_elements:
         block_name_x, block_name_y = position_animator.get_position_offset(
@@ -681,60 +367,17 @@ def generate_image_bytes(
         block_name_x, block_name_y, block_w, block_h,
         precomputed.padding, precomputed.W, precomputed.H
     )
-
     draw.text((block_name_x, block_name_y), block_name, font=bottom_font, fill=blended)
 
-    try:
-        if font_path_key == 'ctrl':
-            font_file_name = Path(cfg.ctrl_font_file).name
-        elif font_path_key == 'default':
-            font_file_name = 'default'
-        else:
-            font_file_name = Path(str(font_path_key)).name
-    except Exception:
-        font_file_name = str(font_path_key)
-
-    max_w = precomputed.W // 3
-    fname = font_file_name
-    bbox = draw.textbbox((0, 0), fname, font=bottom_font)
-    fname_w = bbox[2] - bbox[0]
-    fname_h = bbox[3] - bbox[1]
-    if fname_w > max_w:
-        name_body = fname
-        while True:
-            if len(name_body) <= 4:
-                name_body = name_body[:4]
-                fname = name_body
-                break
-            keep = max(1, len(name_body) - 6)
-            name_candidate = '...' + name_body[-keep:]
-            bbox = draw.textbbox((0, 0), name_candidate, font=bottom_font)
-            fname_w = bbox[2] - bbox[0]
-            if fname_w <= max_w:
-                fname = name_candidate
-                break
-            name_body = name_body[1:]
-
-    font_name_x, font_name_y = precomputed.font_name_pos
-    if position_animator and animated_elements and 'font' in animated_elements:
-        font_name_x, font_name_y = position_animator.get_position_offset(
-            gradient_index, font_name_x, font_name_y, 'font'
-        )
-
-    font_name_x, font_name_y = check_bounds_with_padding(
-        font_name_x, font_name_y, fname_w, fname_h,
-        precomputed.padding, precomputed.W, precomputed.H
-    )
-
-    draw.text((font_name_x, font_name_y), fname, font=bottom_font, fill=blended)
+    # 右下角NamesList信息
+    info_start_x = precomputed.W - precomputed.info_max_width - precomputed.padding
+    info_height = 0
 
     if show_names_info:
         info_lines = names_list_parser.get_info_for_code(entry.code_str)
         if info_lines and len(info_lines) > 1:
-            info_start_x = precomputed.W - precomputed.info_max_width - precomputed.info_right_margin
-
-            if info_start_x < main_char_right_edge + precomputed.padding:
-                info_start_x = main_char_right_edge + precomputed.padding
+            if info_start_x < main_char_right_edge + precomputed.element_spacing:
+                info_start_x = main_char_right_edge + precomputed.element_spacing
 
             lines_to_show = []
             total_lines_needed = 0
@@ -752,30 +395,25 @@ def generate_image_bytes(
 
                 lines_needed = calculate_lines_needed(line, precomputed.info_max_width, bottom_font)
                 total_lines_needed += lines_needed
-
                 lines_to_show.append((line, lines_needed))
 
             if lines_to_show:
                 total_display_height = total_lines_needed * precomputed.info_line_height
+                info_height = total_display_height
 
                 start_y = precomputed.info_bottom_y - total_display_height
 
                 if start_y < precomputed.padding:
                     start_y = precomputed.padding
-
-                info_max_height = precomputed.info_bottom_y - precomputed.padding
-                if total_display_height > info_max_height:
-                    max_lines = int(info_max_height / precomputed.info_line_height)
+                    max_height = precomputed.info_bottom_y - precomputed.padding
+                    max_lines = int(max_height / precomputed.info_line_height)
                     if max_lines > 0:
                         lines_to_show = lines_to_show[:max_lines]
-                        total_display_height = sum(
-                            lines_needed for _, lines_needed in lines_to_show) * precomputed.info_line_height
+                        total_display_height = sum(l[1] for l in lines_to_show) * precomputed.info_line_height
                         start_y = precomputed.info_bottom_y - total_display_height
 
-                if info_start_x < precomputed.padding:
-                    info_start_x = precomputed.padding
-                elif info_start_x + precomputed.info_max_width > precomputed.W - precomputed.padding:
-                    info_start_x = precomputed.W - precomputed.padding - precomputed.info_max_width
+                info_start_x = max(precomputed.padding,
+                                   min(info_start_x, precomputed.W - precomputed.padding - precomputed.info_max_width))
 
                 current_y = start_y
 
@@ -790,8 +428,96 @@ def generate_image_bytes(
                         base_font=bottom_font,
                         fg_color=blended
                     )
-
                     current_y = end_y + precomputed.info_line_height
+
+    # ========== 左右竖进度条 ==========
+    if show_block_progress_bar or show_global_progress_bar:
+        # 计算进度值
+        block_progress_val = index_in_block / total_in_block if total_in_block > 0 else 0
+        global_progress_val = (global_index + 1) / total_entries if total_entries > 0 else 0
+
+        # 左侧进度条（区块进度）
+        if show_block_progress_bar and total_in_block > 0 and index_in_block > 0:
+            # 渲染左侧竖进度条
+            render_vertical_progress_bar(
+                draw=draw,
+                x=precomputed.left_progress_x,
+                y_start=precomputed.progress_start_y,
+                y_end=precomputed.progress_end_y,
+                width=precomputed.progress_bar_width,
+                progress=block_progress_val,
+                fg_color=blended,
+                bg_color=bg_color[:3],
+                is_left=True
+            )
+
+            # 左侧百分比文本 - 放在进度条右侧
+            percent_text = f"{block_progress_val * 100:.1f}%"
+            percent_x = precomputed.left_progress_x + precomputed.progress_bar_width + precomputed.percent_spacing
+
+            # 垂直居中显示百分比（与进度条位置对应）
+            percent_bbox = draw.textbbox((0, 0), percent_text, font=bottom_font)
+            percent_height = percent_bbox[3] - percent_bbox[1]
+
+            # 计算百分比文本的Y位置，使其与当前进度位置对应
+            # 进度百分比位置：从底部向上计算
+            progress_y = precomputed.progress_end_y - int(block_progress_val * precomputed.progress_actual_height)
+            percent_y = progress_y - percent_height // 2
+
+            # 确保不超出进度条区域
+            percent_y = max(precomputed.progress_start_y,
+                            min(percent_y, precomputed.progress_end_y - percent_height))
+
+            draw.text((percent_x, percent_y), percent_text, font=bottom_font, fill=blended)
+
+        # 右侧进度条（全局进度）
+        if show_global_progress_bar and total_entries > 0:
+            # 渲染右侧竖进度条
+            render_vertical_progress_bar(
+                draw=draw,
+                x=precomputed.right_progress_x,
+                y_start=precomputed.progress_start_y,
+                y_end=precomputed.progress_end_y,
+                width=precomputed.progress_bar_width,
+                progress=global_progress_val,
+                fg_color=blended,
+                bg_color=bg_color[:3],
+                is_left=False
+            )
+
+            # 右侧百分比文本 - 放在进度条左侧
+            percent_text = f"{global_progress_val * 100:.1f}%"
+            percent_bbox = draw.textbbox((0, 0), percent_text, font=bottom_font)
+            percent_width = percent_bbox[2] - percent_bbox[0]
+            percent_height = percent_bbox[3] - percent_bbox[1]
+
+            percent_x = precomputed.right_progress_x - percent_width - precomputed.percent_spacing
+
+            # 计算百分比文本的Y位置，使其与当前进度位置对应
+            progress_y = precomputed.progress_end_y - int(global_progress_val * precomputed.progress_actual_height)
+            percent_y = progress_y - percent_height // 2
+
+            # 确保不超出进度条区域
+            percent_y = max(precomputed.progress_start_y,
+                            min(percent_y, precomputed.progress_end_y - percent_height))
+
+            # 确保百分比文本不超出左边界
+            if percent_x >= precomputed.padding:
+                draw.text((percent_x, percent_y), percent_text, font=bottom_font, fill=blended)
+
+    # ========== 底部转圈加载（字符串切换，整体居中） ==========
+    if show_side_spinner and spinner_strings:
+        # 渲染底部转圈圈字符串（在多个完整字符串之间切换）
+        render_spinner_string_at_bottom(
+            draw=draw,
+            spinner_strings=spinner_strings,
+            step=spinner_step,
+            start_x=precomputed.spinner_start_x,
+            end_x=precomputed.spinner_end_x,
+            y=precomputed.spinner_y,
+            font=bottom_font,
+            color=blended
+        )
 
     buf = BytesIO()
     buf.truncate(50000)
@@ -813,6 +539,7 @@ def generate_image_bytes(
 
     out_path = cfg.output_dir / f"image_{output_filename}.png"
     return data, out_path, None
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Unicode 字符图片生成器')
@@ -924,76 +651,80 @@ def parse_args():
         action='store_true',
         help='禁用组合类标记(Mn/Mc/Me)的◌覆盖提示'
     )
+    parser.add_argument(
+        '--show-encoding',
+        action='store_true',
+        help='在正上方四行垂直居中显示字符的UTF-8、UTF-16LE、UTF-16BE编码（不显示UTF-32）'
+    )
+    parser.add_argument(
+        '--show-block-position',
+        action='store_true',
+        help='在右上角字符名称下一行显示 [区块内第几个]/[区块总字符数]'
+    )
+    parser.add_argument(
+        '--show-global-position',
+        action='store_true',
+        help='在左上角字符码位下一行显示 [全局第几个]/[总字符数]'
+    )
+    parser.add_argument(
+        '--show-block-progress-bar',
+        action='store_true',
+        help='在底部中间显示区块进度条及百分比'
+    )
+    parser.add_argument(
+        '--show-global-progress-bar',
+        action='store_true',
+        help='在底部中间显示全局进度条及百分比'
+    )
+    parser.add_argument(
+        '--show-side-spinner',
+        action='store_true',
+        help='在左右两边正中间添加转圈圈式加载条'
+    )
+    parser.add_argument(
+        '--spinner-strings',
+        type=str,
+        default='-,\\,|,/',
+        help='转圈圈使用的字符串列表，用逗号分隔，例如 "-,\\,|,/" 或 "◐,◓,◑,◒" 或 "⣾,⣽,⣻,⢿,⡿,⣟,⣯,⣷"'
+    )
+    parser.add_argument(
+        '--spinner-step-interval',
+        type=int,
+        default=1,
+        help='每隔几张图片切换一次转圈圈字符串，默认1'
+    )
+    parser.add_argument(
+        '--scale',
+        type=float,
+        default=1.0,
+        help='分辨率及所有字号、边距的等比缩放因子，例如 0.5 缩小一半，2.0 放大一倍'
+    )
     return parser.parse_args()
 
-def create_filename_mapping(entries: list[UnicodeEntry]) -> dict[str, str]:
-    """创建文件名映射：原文件名 -> 随机文件名"""
-    original_filenames = [entry.code_str for entry in entries]
-    shuffled_filenames = original_filenames.copy()
-    random.shuffle(shuffled_filenames)
-
-    filename_mapping = {}
-    for i, original in enumerate(original_filenames):
-        filename_mapping[original] = shuffled_filenames[i]
-
-    logging.info(f"创建文件名映射: {len(filename_mapping)} 个文件")
-    if len(filename_mapping) > 0:
-        sample_keys = list(filename_mapping.keys())[:3]
-        for key in sample_keys:
-            logging.info(f"  示例: {key} -> {filename_mapping[key]}")
-
-    return filename_mapping
-
-def parse_content_position(position_str: str):
-    if not position_str:
-        return None, None
-
-    if position_str.lower() == 'random':
-        return 'random', None
-
-    parts = position_str.split(',')
-    if len(parts) >= 3 and parts[0].lower() == 'fixed':
-        try:
-            x = int(parts[1])
-            y = int(parts[2])
-            return 'fixed', (x, y)
-        except ValueError:
-            logging.warning(f"无法解析固定位置参数: {position_str}")
-
-    return None, None
 
 def main():
     args = parse_args()
 
     random.seed()
 
-    def load_combining_marks(path: Path) -> set[int]:
-        cps = set()
-        try:
-            for line in path.read_text(encoding='utf-8').splitlines():
-                if not line or line.startswith('#'):
-                    continue
-                f = line.split(';')
-                if len(f) < 3:
-                    continue
-                cp = int(f[0], 16)
-                if f[2] in ('Mn', 'Mc', 'Me'):
-                    cps.add(cp)
-        except Exception as e:
-            logging.error(f"读取 UnicodeData.txt 失败: {e}")
-        return cps
-
-    unicode_data_path = Path.cwd() / 'UnicodeData.txt'
-    if unicode_data_path.exists():
-        combining_cps = load_combining_marks(unicode_data_path)
-        logging.info(f"加载 {len(combining_cps)} 个组合标记")
-    else:
-        combining_cps = set()
-        logging.warning("UnicodeData.txt 未找到，组合 overlay 无效")
-
-    overlay_enabled = not args.disable_comb_overlay
     setup_logging()
-    cfg = Config()
+
+    # 解析转圈字符串列表
+    spinner_strings = [s.strip() for s in args.spinner_strings.split(',')]
+    logging.info(f"转圈字符串列表: {spinner_strings}")
+
+    # 加载基础配置
+    base_cfg = Config()
+
+    # 应用缩放因子
+    scale_factor = args.scale
+    if scale_factor <= 0:
+        logging.error("缩放因子必须大于0，使用默认值1.0")
+        scale_factor = 1.0
+
+    # 创建缩放后的配置
+    cfg = ScaledConfig(base_cfg, scale_factor)
+
     cfg.output_dir.mkdir(exist_ok=True)
 
     if args.png_quality == 'fast':
@@ -1006,6 +737,7 @@ def main():
     existing_files = {p.stem.split('_')[-1] for p in cfg.output_dir.glob('*.png') if p.stat().st_size >= 1000}
 
     entries = load_unicode_entries(cfg.unicode_file)
+    total_entries = len(entries)
 
     filename_mapping = None
     if args.shuffle_content:
@@ -1029,6 +761,35 @@ def main():
         logging.info("所有图片已存在，无需生成")
         return
 
+    # 加载Unicode数据
+    unicode_data_path = Path.cwd() / 'UnicodeData.txt'
+    if unicode_data_path.exists():
+        combining_cps = load_combining_marks(unicode_data_path)
+        logging.info(f"加载 {len(combining_cps)} 个组合标记")
+        unicode_names = load_unicode_names(unicode_data_path)
+    else:
+        combining_cps = set()
+        unicode_names = {}
+        logging.warning("UnicodeData.txt 未找到，组合 overlay 无效")
+
+    overlay_enabled = not args.disable_comb_overlay
+
+    # 加载Unicode区块
+    blocks_path = Path.cwd() / 'UnicodeBlocks.txt'
+    if blocks_path.exists():
+        blocks = load_unicode_blocks(blocks_path)
+        logging.info(f"加载 {len(blocks)} 个 Unicode blocks")
+        block_index_mapping = build_block_index_mapping(blocks, entries)
+    else:
+        blocks = []
+        block_index_mapping = {}
+        logging.warning("UnicodeBlocks.txt 未找到，区块名称显示为 No_Block")
+
+    # 加载NamesList
+    names_list_path = Path.cwd() / 'NamesList.txt'
+    names_list_parser = NamesListParser(names_list_path)
+
+    # 颜色相关设置
     gradient_manager = None
     if args.rainbow_gradient:
         if args.gradient_colors:
@@ -1064,6 +825,7 @@ def main():
         flash_color = get_random_color()
         logging.info("使用随机闪出颜色")
 
+    # 动画设置
     animated_elements = []
     if args.animate_elements:
         animated_elements = [elem.strip() for elem in args.animate_elements.split(',')]
@@ -1077,36 +839,34 @@ def main():
         position_animator = PositionAnimator(
             total_images=len(to_process),
             animation_type=args.animation_type,
-            amplitude=args.animation_amplitude,
+            amplitude=int(args.animation_amplitude * scale_factor),
             speed=args.animation_speed,
             movement_speed=args.movement_speed
         )
         logging.info(
-            f"动画设置: 类型={args.animation_type}, 幅度={args.animation_amplitude}, 飘动速度={args.movement_speed}")
+            f"动画设置: 类型={args.animation_type}, 幅度={int(args.animation_amplitude * scale_factor)}, 飘动速度={args.movement_speed}")
         logging.info(f"颜色变化速度系数: {args.animation_speed}")
 
+    # 内容位置设置
     content_position_type, content_position_value = parse_content_position(args.content_position)
     content_position_random = (content_position_type == 'random')
     content_position_fixed = content_position_value if content_position_type == 'fixed' else None
+
+    if content_position_fixed:
+        content_position_fixed = (
+            int(content_position_fixed[0] * scale_factor),
+            int(content_position_fixed[1] * scale_factor)
+        )
 
     if content_position_random:
         logging.info("内容位置: 完全随机")
     elif content_position_fixed:
         logging.info(f"内容位置: 固定位置 ({content_position_fixed[0]}, {content_position_fixed[1]})")
 
-    names_list_path = Path.cwd() / 'NamesList.txt'
-    names_list_parser = NamesListParser(names_list_path)
+    # 预计算值
+    precomputed = PrecomputedValues(cfg, scale_factor)
 
-    precomputed = PrecomputedValues(cfg)
-
-    blocks_path = Path.cwd() / 'UnicodeBlocks.txt'
-    if blocks_path.exists():
-        blocks = load_unicode_blocks(blocks_path)
-        logging.info(f"加载 {len(blocks)} 个 Unicode blocks")
-    else:
-        blocks = []
-        logging.warning("UnicodeBlocks.txt 未找到，区块名称显示为 No_Block")
-
+    # 颜色管理器
     color_mgr = None
     if args.random_color and not gradient_manager and not flash_color:
         logging.info("启用完全随机颜色模式")
@@ -1141,8 +901,24 @@ def main():
         blend_cache, overlay_cache = precompute_blend_colors(cfg, [cfg.background_color])
 
     logging.info(
-        f"需要生成 {len(to_process)} 张图片 (workers={args.workers}, png-quality={args.png_quality}, show-names-info={args.show_names_info})")
+        f"需要生成 {len(to_process)} 张图片 (workers={args.workers}, png-quality={args.png_quality}, "
+        f"scale={scale_factor:.2f}, 最终分辨率: {cfg.image_size[0]}x{cfg.image_size[1]})")
 
+    # 记录新增功能启用状态
+    if args.show_encoding:
+        logging.info("启用编码信息显示（UTF-8、UTF-16LE、UTF-16BE）")
+    if args.show_block_position:
+        logging.info("启用区块位置显示 [n/m]")
+    if args.show_global_position:
+        logging.info("启用全局位置显示 [n/m]")
+    if args.show_block_progress_bar:
+        logging.info("启用区块进度条显示")
+    if args.show_global_progress_bar:
+        logging.info("启用全局进度条显示")
+    if args.show_side_spinner:
+        logging.info(f"启用转圈圈动画，字符串列表: {spinner_strings}，切换间隔: {args.spinner_step_interval}张")
+
+    # 加载字体
     bottom_font = ImageFont.truetype(str(cfg.bottom_font_file), cfg.bottom_font_size)
     try:
         ctrl_font = ImageFont.truetype(str(cfg.ctrl_font_file), cfg.middle_font_size)
@@ -1155,8 +931,7 @@ def main():
     text_cache: dict[str, tuple[int, int]] = {}
     overlay_bbox_cache: dict[str, tuple[int, int]] = {}
 
-    unicode_names = load_unicode_names(unicode_data_path) if unicode_data_path.exists() else {}
-
+    # 启动写入线程
     q: Queue = Queue(maxsize=200)
     writer = Thread(target=optimized_writer_thread_fn, args=(q,), daemon=True)
     writer.start()
@@ -1178,6 +953,15 @@ def main():
                 gradient_index = i
 
             color_index = gradient_index * args.animation_speed
+
+            # 获取区块内进度信息
+            index_in_block = 0
+            total_in_block = 0
+            if block_index_mapping and entry.code_str in block_index_mapping:
+                index_in_block, total_in_block = block_index_mapping[entry.code_str]
+
+            # 计算转圈圈步骤
+            spinner_step = (i // args.spinner_step_interval) % len(spinner_strings)
 
             future = pool.submit(
                 generate_image_bytes,
@@ -1203,6 +987,19 @@ def main():
                 content_position_fixed,
                 args.show_names_info,
                 args.smooth_gradient,
+                args.show_encoding,
+                args.show_block_position,
+                args.show_global_position,
+                args.show_block_progress_bar,
+                args.show_global_progress_bar,
+                args.show_side_spinner,
+                spinner_step,
+                spinner_strings,
+                i,
+                total_entries,
+                total_in_block,
+                index_in_block,
+                scale_factor,
             )
             try:
                 data, path, matched_key = future.result()
@@ -1223,6 +1020,7 @@ def main():
 
     if args.shuffle_content and filename_mapping:
         logging.info(f"文件名已随机化")
+
 
 if __name__ == '__main__':
     main()
