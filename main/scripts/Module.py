@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import json
 import logging
 from queue import Queue
@@ -30,8 +27,9 @@ from unicode_utils import (
 from image_utils import (
     fast_blend_colors, normalize_color, get_random_color, parse_color_list,
     precompute_blend_colors, calculate_lines_needed, render_info_text_simple,
-    render_progress_bar, check_bounds_with_padding, truncate_text_to_width,render_vertical_progress_bar,
-    render_spinner_string_at_bottom)
+    render_vertical_progress_bar, render_progress_bar, render_spinner_string_at_bottom,
+    check_bounds_with_padding, truncate_text_to_width
+)
 
 from font_utils import preload_middle_fonts, get_font_display_name
 
@@ -40,20 +38,21 @@ from file_utils import (
     create_filename_mapping, parse_content_position
 )
 
+
 @dataclass
 class Config:
     unicode_file: Path = Path.cwd() / 'Unicode.txt'
     output_dir: Path = Path.cwd() / 'png'
     font_files: list[Path] = None
     ctrl_font_file: Path = Path('Ctrl-Ctrl.ttf')
-    bottom_font_file: Path = Path.cwd() / 'PressStartHan2P.ttf'
+    bottom_font_file: Path = Path.cwd() / 'PressStart2P-1.ttf'
     music_file: Path = Path.cwd() / 'DUTM.m4a'
     middle_font_size: int = 512
     bottom_font_size: int = 19
-    text_position: tuple[int, int] = (0, 0) #(text_position_x, text_position_y)
+    text_position: tuple[int, int] = (0, 0)  # (text_position_x, text_position_y)
     middle_font_color: tuple[int, int, int, int] = (255, 255, 255, 255)
     image_size: tuple[int, int] = (1920, 1080)
-    background_color: tuple[int, int, int, int] = (0,0,0,255)
+    background_color: tuple[int, int, int, int] = (0, 0, 0, 255)
     color_cycle: list[tuple[int, int, int, int]] = None
 
     png_compress_level: int = 2
@@ -78,7 +77,7 @@ class Config:
 
     @staticmethod
     @lru_cache(maxsize=128)
-    def _hex_to_rgba_fast(s: str) -> tuple[int,int,int,int]:
+    def _hex_to_rgba_fast(s: str) -> tuple[int, int, int, int]:
         """优化的hex转RGBA，使用缓存避免重复计算"""
         s = s.lstrip('#')
         if len(s) == 6:
@@ -87,12 +86,12 @@ class Config:
             raise ValueError(f"Invalid hex color: {s!r}")
         return (
             int(s[0:2], 16),
-            int(s[2:4], 16), 
+            int(s[2:4], 16),
             int(s[4:6], 16),
             int(s[6:8], 16)
         )
 
-    def _hex_to_rgba(self, s: str) -> tuple[int,int,int,int]:
+    def _hex_to_rgba(self, s: str) -> tuple[int, int, int, int]:
         return self._hex_to_rgba_fast(s)
 
 
@@ -108,6 +107,7 @@ class ColorManager:
     根据 description 的哈希值循环分配背景色，保持相同 description 使用相同颜色。
     支持预定义映射和直接颜色值。
     """
+
     def __init__(self, color_cycle: list[tuple[int, int, int, int]], state_file: Path):
         self._cycle = color_cycle
         self._mapping: dict[str, int | str] = {}
@@ -147,12 +147,12 @@ class ColorManager:
     def save_state(self, force=False):
         if not force and not self._dirty:
             return
-            
+
         try:
             temp_file = self.state_file.with_suffix('.json.tmp')
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump({
-                    "mapping": self._mapping, 
+                    "mapping": self._mapping,
                     "counter": self._counter
                 }, f, indent=2, ensure_ascii=False)
 
@@ -173,7 +173,7 @@ class ColorManager:
         """将十六进制颜色转换为 RGBA 元组"""
         hex_color = hex_color.lstrip('#')
         if len(hex_color) == 3:  # #RGB
-            hex_color = ''.join([c*2 for c in hex_color]) + 'FF'
+            hex_color = ''.join([c * 2 for c in hex_color]) + 'FF'
         elif len(hex_color) == 6:  # #RRGGBB
             hex_color = hex_color + 'FF'
         elif len(hex_color) != 8:  # #RRGGBBAA
@@ -190,7 +190,7 @@ class ColorManager:
         """从描述中提取关键部分,忽略详细信息"""
         if description in self._key_cache:
             return self._key_cache[description]
-            
+
         if '|' in description:
             key = description.split('|')[0].strip()
         else:
@@ -236,7 +236,7 @@ class ColorManager:
                 color = self._hex_to_rgba_cached(value)
             else:
                 color = self._cycle[value % len(self._cycle)]
-            
+
             cache_key = f"{key}_{value}"
             if len(self._color_cache) < 5000:
                 self._color_cache[cache_key] = color
@@ -253,7 +253,7 @@ class ColorManager:
             cache_keys_to_remove = [k for k in self._color_cache.keys() if k.startswith(f"{key}_")]
             for k in cache_keys_to_remove:
                 del self._color_cache[k]
-            
+
             if self._changes_count >= self._save_batch_size:
                 self.save_state()
                 self._changes_count = 0
@@ -264,7 +264,7 @@ class ColorManager:
         unique_descriptions = []
 
         sorted_entries = sorted(entries, key=lambda x: int(x.code_str[2:], 16))
-        
+
         for entry in sorted_entries:
             key = self.get_key_from_description(entry.description)
             if key not in seen:
@@ -276,7 +276,7 @@ class ColorManager:
                 if desc not in self._mapping:
                     self._mapping[desc] = self._counter
                     self._counter = (self._counter + 1) % len(self._cycle)
-            
+
             self._dirty = True
             self.save_state(force=True)
 
@@ -298,7 +298,7 @@ def load_unicode_entries(path: Path) -> list[UnicodeEntry]:
 
     content = path.read_text(encoding='utf-8')
     lines = content.splitlines()
-    
+
     for line in lines:
         line = line.strip()
         if not line:
@@ -313,9 +313,9 @@ def load_unicode_entries(path: Path) -> list[UnicodeEntry]:
         font_path = parts[0].strip().strip('"')
         code_str = parts[1].strip().strip('"')
         desc = parts[2].strip().strip('"')
-        
+
         entries.append(UnicodeEntry(Path(font_path), code_str, desc))
-    
+
     return entries
 
 
@@ -331,7 +331,7 @@ def setup_logging():
 def writer_thread_fn(q: Queue, batch_size: int = 10):
     """单线程顺序写入磁盘，减少 HDD 随机寻道。"""
     batch = []
-    
+
     while True:
         item = q.get()
         if item is None:
@@ -339,12 +339,12 @@ def writer_thread_fn(q: Queue, batch_size: int = 10):
                 _write_batch(batch)
             q.task_done()
             break
-            
+
         batch.append(item)
         if len(batch) >= batch_size:
             _write_batch(batch)
             batch.clear()
-            
+
         q.task_done()
 
 
@@ -360,7 +360,7 @@ def _write_batch(batch: list):
 
 
 @lru_cache(maxsize=1024)
-def blend_colors(fg: tuple[int,int,int], bg: tuple[int,int,int], alpha: float) -> tuple[int,int,int]:
+def blend_colors(fg: tuple[int, int, int], bg: tuple[int, int, int], alpha: float) -> tuple[int, int, int]:
     """缓存版颜色混合函数"""
     inv_alpha = 1.0 - alpha
     return (
