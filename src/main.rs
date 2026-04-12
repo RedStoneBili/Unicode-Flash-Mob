@@ -8,6 +8,7 @@ mod unicode_range_generator;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use font_unicode_decipher::{ExtractMode, FontStyle};
 
 #[derive(Parser)]
 #[command(author, version, about = "Unicode 工具集")]
@@ -27,6 +28,10 @@ enum Commands {
         font_files: Vec<PathBuf>,
         #[arg(short, long, value_name = "OUT_FILE")]
         out: Option<PathBuf>,
+        #[arg(long, value_name = "MODE", default_value = "any")]
+        mode: String,
+        #[arg(long, value_name = "STYLE", default_value = "fallback")]
+        style: String,
     },
     GenerateUnicodeRange {
         #[arg(short, long, value_name = "FILENAME")]
@@ -51,8 +56,10 @@ fn main() -> Result<()> {
         Commands::WriteSettings => settings_writer::main()?,
         Commands::ProcessUnicodeBlock => process_unicodeblock::main()?,
         Commands::ProcessUnicodeData => process_unicodedata::main()?,
-        Commands::Extract { font_files, out } => {
-            font_unicode_decipher::extract_unicode_from_fonts(&font_files, out.as_deref())?
+        Commands::Extract { font_files, out, mode, style } => {
+            let extract_mode = ExtractMode::from_str(&mode)?;
+            let font_style = FontStyle::from_str(&style)?;
+            font_unicode_decipher::extract_unicode_from_fonts(&font_files, out.as_deref(), extract_mode, font_style)?
         }
         Commands::GenerateUnicodeRange {
             file,

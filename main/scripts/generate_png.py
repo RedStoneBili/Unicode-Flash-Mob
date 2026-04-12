@@ -83,10 +83,8 @@ def generate_image_bytes(
         total_entries: int = 0,
         total_in_block: int = 0,
         index_in_block: int = 0,
-        # 缩放因子
         scale_factor: float = 1.0,
 ) -> tuple[bytes, Path, str | None]:
-    """图片生成函数"""
     try:
         cp = int(entry.code_str.strip()[2:], 16)
     except:
@@ -94,6 +92,10 @@ def generate_image_bytes(
 
     char = get_char(cp)
     is_control = (cp in CTRLS)
+
+    font_paths = entry.get_font_paths()
+    is_multi_font = entry.has_multiple_fonts()
+    is_compare_mode = entry.is_compare_mode() if hasattr(entry, 'is_compare_mode') else ('|' in entry.font_path)
 
     if flash_color:
         bg_color = flash_color
@@ -113,75 +115,6 @@ def generate_image_bytes(
     img = Image.new('RGBA', cfg.image_size, bg_color)
     draw = ImageDraw.Draw(img)
 
-    if is_control:
-        middle_font = ctrl_font
-        font_path_key = 'ctrl'
-    else:
-        middle_font = middle_font_cache.get(entry.font_path)
-        font_path_key = entry.font_path
-        if not middle_font:
-            for p in cfg.font_files:
-                f = middle_font_cache.get(p)
-                if f:
-                    middle_font = f
-                    font_path_key = p
-                    break
-
-    if not middle_font:
-        char = "无法加载字体：" + char
-        middle_font = ImageFont.load_default()
-        font_path_key = 'default'
-
-    if font_path_key in metrics_cache:
-        ascent, descent = metrics_cache[font_path_key]
-    else:
-        ascent, descent = middle_font.getmetrics()
-        if font_path_key != 'default':
-            metrics_cache[font_path_key] = (ascent, descent)
-
-    baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + precomputed.baseline_offset
-
-    final_text_x_offset = precomputed.text_x_offset
-    final_baseline_offset = precomputed.baseline_offset
-
-    if content_position_random:
-        final_text_x_offset = random.randint(-200, 200)
-        final_baseline_offset = random.randint(-100, 100)
-    elif content_position_fixed:
-        final_text_x_offset, final_baseline_offset = content_position_fixed
-
-    anim_x, anim_y = 0, 0
-    if position_animator and animated_elements and 'content' in animated_elements:
-        anim_x, anim_y = position_animator.get_position_offset(
-            gradient_index, 0, 0, 'content'
-        )
-        final_text_x_offset += anim_x
-        final_baseline_offset += anim_y
-
-    baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + final_baseline_offset
-
-    if hasattr(middle_font, 'path'):
-        cache_key = f"{char}_{middle_font.path}_{middle_font.size}"
-    else:
-        cache_key = f"{char}_{font_path_key}_{cfg.middle_font_size}"
-
-    if cache_key in text_cache:
-        w, h = text_cache[cache_key]
-    else:
-        bbox = draw.textbbox((0, 0), char, font=middle_font)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        w = max(1, w)
-        h = max(1, h)
-        text_cache[cache_key] = (int(w), int(h))
-
-    x = (precomputed.W - w) // 2 + final_text_x_offset
-    y = baseline_y - ascent
-
-    x, y = check_bounds_with_padding(x, y, w, h, precomputed.padding, precomputed.W, precomputed.H)
-
-    main_char_right_edge = x + w
-
     bg_key = tuple(bg_color[:3])
     if bg_key in blend_cache:
         blended = blend_cache[bg_key]
@@ -190,35 +123,250 @@ def generate_image_bytes(
         if not random_color and not gradient_manager and not flash_color:
             blend_cache[bg_key] = blended
 
-    if overlay_enabled and cp in combining_cps:
-        overlay_char = '\u25CC'
-        overlay_cache_key = f"{overlay_char}_{font_path_key}_{cfg.middle_font_size}"
+    # ---------- 绘制主字符区域 ----------
+    if is_multi_font and is_compare_mode:
+        num_fonts = len(font_paths)
+        precomputed.multi_font_total_width = num_fonts * precomputed.multi_font_slot_width + (num_fonts - 1) * precomputed.multi_font_spacing
+        total_width = precomputed.multi_font_total_width
+        start_x = (precomputed.W - total_width) // 2
+        current_x = start_x
 
-        if overlay_cache_key in overlay_bbox_cache:
-            ow, oh = overlay_bbox_cache[overlay_cache_key]
+        for i, font_path_str in enumerate(font_paths):
+            # 解析字体路径
+            font_path = None
+            font = None
+            font_key = None
+
+            direct_path = Path(font_path_str)
+            if direct_path.exists():
+                font_path = direct_path
+            else:
+                for p in cfg.font_files:
+                    if p.name == font_path_str or str(p) == font_path_str:
+                        font_path = p
+                        break
+                if font_path is None:
+                    cwd_path = Path.cwd() / font_path_str
+                    if cwd_path.exists():
+                        font_path = cwd_path
+                if font_path is None:
+                    script_dir = Path(__file__).parent
+                    script_path = script_dir / font_path_str
+                    if script_path.exists():
+                        font_path = script_path
+                if font_path is None:
+                    main_dir = Path.cwd() / 'main'
+                    main_path = main_dir / font_path_str
+                    if main_path.exists():
+                        font_path = main_path
+
+            if font_path and font_path in middle_font_cache:
+                font = middle_font_cache[font_path]
+                font_key = font_path
+            elif font_path:
+                try:
+                    font = ImageFont.truetype(str(font_path), cfg.middle_font_size)
+                    middle_font_cache[font_path] = font
+                    font_key = font_path
+                except Exception as e:
+                    logging.warning(f"加载字体失败 {font_path}: {e}")
+                    font = None
+
+            if not font:
+                for p in cfg.font_files:
+                    f = middle_font_cache.get(p)
+                    if f:
+                        font = f
+                        font_key = p
+                        break
+
+            if not font:
+                font = ImageFont.load_default()
+                font_key = 'default'
+
+            if is_control:
+                font = ctrl_font
+                font_key = 'ctrl'
+
+            if font_key in metrics_cache:
+                ascent, descent = metrics_cache[font_key]
+            else:
+                ascent, descent = font.getmetrics()
+                if font_key != 'default':
+                    metrics_cache[font_key] = (ascent, descent)
+
+            baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + precomputed.baseline_offset
+
+            final_text_x_offset = precomputed.text_x_offset
+            final_baseline_offset = precomputed.baseline_offset
+
+            if content_position_random:
+                final_text_x_offset = random.randint(-200, 200)
+                final_baseline_offset = random.randint(-100, 100)
+            elif content_position_fixed:
+                final_text_x_offset, final_baseline_offset = content_position_fixed
+
+            anim_x, anim_y = 0, 0
+            if position_animator and animated_elements and 'content' in animated_elements:
+                anim_x, anim_y = position_animator.get_position_offset(
+                    gradient_index + i * 10, 0, 0, 'content'
+                )
+                final_text_x_offset += anim_x
+                final_baseline_offset += anim_y
+
+            baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + final_baseline_offset
+
+            if hasattr(font, 'path'):
+                cache_key = f"{char}_{font.path}_{font.size}"
+            else:
+                cache_key = f"{char}_{font_key}_{cfg.middle_font_size}"
+
+            if cache_key in text_cache:
+                w, h = text_cache[cache_key]
+            else:
+                bbox = draw.textbbox((0, 0), char, font=font)
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                w = max(1, w)
+                h = max(1, h)
+                text_cache[cache_key] = (int(w), int(h))
+
+            x = current_x + (precomputed.multi_font_slot_width - w) // 2
+            y = baseline_y - ascent
+
+            x, y = check_bounds_with_padding(x, y, w, h, precomputed.padding, precomputed.W, precomputed.H)
+
+            if overlay_enabled and cp in combining_cps:
+                overlay_char = '\u25CC'
+                overlay_cache_key = f"{overlay_char}_{font_key}_{cfg.middle_font_size}"
+                if overlay_cache_key in overlay_bbox_cache:
+                    ow, oh = overlay_bbox_cache[overlay_cache_key]
+                else:
+                    obbox = draw.textbbox((0, 0), overlay_char, font=ctrl_font)
+                    ow = obbox[2] - obbox[0]
+                    oh = obbox[3] - obbox[1]
+                    ow = max(1, ow)
+                    oh = max(1, oh)
+                    overlay_bbox_cache[overlay_cache_key] = (int(ow), int(oh))
+
+                if bg_key in overlay_cache:
+                    overlay_color = overlay_cache[bg_key]
+                else:
+                    overlay_color = fast_blend_colors(precomputed.fg_color, bg_color, precomputed.overlay_alpha)
+                    if not random_color and not gradient_manager and not flash_color:
+                        overlay_cache[bg_key] = overlay_color
+
+                ox = current_x + (precomputed.multi_font_slot_width - ow) // 2
+                oy = baseline_y - ascent
+                ox, oy = check_bounds_with_padding(ox, oy, ow, oh, precomputed.padding, precomputed.W, precomputed.H)
+                draw.text((ox, oy), overlay_char, font=ctrl_font, fill=overlay_color)
+
+            draw.text((x, y), char, font=font, fill=blended)
+
+            current_x += precomputed.multi_font_slot_width + precomputed.multi_font_spacing
+
+        main_char_right_edge = start_x + total_width
+    else:
+        # 单字体或回退模式
+        if is_control:
+            middle_font = ctrl_font
+            font_path_key = 'ctrl'
         else:
-            obbox = draw.textbbox((0, 0), overlay_char, font=ctrl_font)
-            ow = obbox[2] - obbox[0]
-            oh = obbox[3] - obbox[1]
-            ow = max(1, ow)
-            oh = max(1, oh)
-            overlay_bbox_cache[overlay_cache_key] = (int(ow), int(oh))
+            font_path_str = font_paths[0] if font_paths else str(cfg.font_files[0])
+            font_path = Path(font_path_str)
+            middle_font = middle_font_cache.get(font_path)
+            font_path_key = font_path
+            if not middle_font:
+                for p in cfg.font_files:
+                    f = middle_font_cache.get(p)
+                    if f:
+                        middle_font = f
+                        font_path_key = p
+                        break
 
-        if bg_key in overlay_cache:
-            overlay_color = overlay_cache[bg_key]
+        if not middle_font:
+            char = "无法加载字体：" + char
+            middle_font = ImageFont.load_default()
+            font_path_key = 'default'
+
+        if font_path_key in metrics_cache:
+            ascent, descent = metrics_cache[font_path_key]
         else:
-            overlay_color = fast_blend_colors(precomputed.fg_color, bg_color, precomputed.overlay_alpha)
-            if not random_color and not gradient_manager and not flash_color:
-                overlay_cache[bg_key] = overlay_color
+            ascent, descent = middle_font.getmetrics()
+            if font_path_key != 'default':
+                metrics_cache[font_path_key] = (ascent, descent)
 
-        ox = (precomputed.W - ow) // 2 + final_text_x_offset
-        oy = baseline_y - ascent
-        ox, oy = check_bounds_with_padding(ox, oy, ow, oh, precomputed.padding, precomputed.W, precomputed.H)
-        draw.text((ox, oy), overlay_char, font=ctrl_font, fill=overlay_color)
+        baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + precomputed.baseline_offset
 
-    draw.text((x, y), char, font=middle_font, fill=blended)
+        final_text_x_offset = precomputed.text_x_offset
+        final_baseline_offset = precomputed.baseline_offset
 
-    # 左上角：码位
+        if content_position_random:
+            final_text_x_offset = random.randint(-200, 200)
+            final_baseline_offset = random.randint(-100, 100)
+        elif content_position_fixed:
+            final_text_x_offset, final_baseline_offset = content_position_fixed
+
+        anim_x, anim_y = 0, 0
+        if position_animator and animated_elements and 'content' in animated_elements:
+            anim_x, anim_y = position_animator.get_position_offset(
+                gradient_index, 0, 0, 'content'
+            )
+            final_text_x_offset += anim_x
+            final_baseline_offset += anim_y
+
+        baseline_y = int(precomputed.center_y + (ascent - descent) / 2) + final_baseline_offset
+
+        if hasattr(middle_font, 'path'):
+            cache_key = f"{char}_{middle_font.path}_{middle_font.size}"
+        else:
+            cache_key = f"{char}_{font_path_key}_{cfg.middle_font_size}"
+
+        if cache_key in text_cache:
+            w, h = text_cache[cache_key]
+        else:
+            bbox = draw.textbbox((0, 0), char, font=middle_font)
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            w = max(1, w)
+            h = max(1, h)
+            text_cache[cache_key] = (int(w), int(h))
+
+        x = (precomputed.W - w) // 2 + final_text_x_offset
+        y = baseline_y - ascent
+
+        x, y = check_bounds_with_padding(x, y, w, h, precomputed.padding, precomputed.W, precomputed.H)
+
+        main_char_right_edge = x + w
+
+        if overlay_enabled and cp in combining_cps:
+            overlay_char = '\u25CC'
+            overlay_cache_key = f"{overlay_char}_{font_path_key}_{cfg.middle_font_size}"
+            if overlay_cache_key in overlay_bbox_cache:
+                ow, oh = overlay_bbox_cache[overlay_cache_key]
+            else:
+                obbox = draw.textbbox((0, 0), overlay_char, font=ctrl_font)
+                ow = obbox[2] - obbox[0]
+                oh = obbox[3] - obbox[1]
+                ow = max(1, ow)
+                oh = max(1, oh)
+                overlay_bbox_cache[overlay_cache_key] = (int(ow), int(oh))
+
+            if bg_key in overlay_cache:
+                overlay_color = overlay_cache[bg_key]
+            else:
+                overlay_color = fast_blend_colors(precomputed.fg_color, bg_color, precomputed.overlay_alpha)
+                if not random_color and not gradient_manager and not flash_color:
+                    overlay_cache[bg_key] = overlay_color
+
+            ox = (precomputed.W - ow) // 2 + final_text_x_offset
+            oy = baseline_y - ascent
+            ox, oy = check_bounds_with_padding(ox, oy, ow, oh, precomputed.padding, precomputed.W, precomputed.H)
+            draw.text((ox, oy), overlay_char, font=ctrl_font, fill=overlay_color)
+
+        draw.text((x, y), char, font=middle_font, fill=blended)
+
+    # ---------- 左上角：码位 ----------
     code_text = entry.code_str
     top_left_x, top_left_y = precomputed.top_left
 
@@ -240,7 +388,6 @@ def generate_image_bytes(
 
     draw.text((top_left_x, top_left_y), code_text, font=bottom_font, fill=blended)
 
-    # 左上角第二行：全局位置 [n/m]
     if show_global_position and total_entries > 0:
         global_position_text = f"{global_index + 1}/{total_entries}"
         global_position_y = top_left_y + code_h + precomputed.line_spacing
@@ -251,7 +398,7 @@ def generate_image_bytes(
         if global_position_y + code_h < precomputed.H - precomputed.padding:
             draw.text((top_left_x, global_position_y), global_position_text, font=bottom_font, fill=blended)
 
-    # 右上角：字符名称
+    # ---------- 右上角：字符名称 ----------
     name_text = ''
     if unicode_names and cp in unicode_names:
         name_text = unicode_names[cp]
@@ -279,10 +426,8 @@ def generate_image_bytes(
 
         draw.text((name_x, name_y), name_text, font=bottom_font, fill=blended)
 
-        # 右上角第二行：区块位置 [n/m]
         if show_block_position and total_in_block > 0 and index_in_block > 0:
             block_position_text = f"{index_in_block}/{total_in_block}"
-
             block_pos_bbox = draw.textbbox((0, 0), block_position_text, font=bottom_font)
             block_pos_w = block_pos_bbox[2] - block_pos_bbox[0]
             block_pos_h = block_pos_bbox[3] - block_pos_bbox[1]
@@ -296,7 +441,7 @@ def generate_image_bytes(
             if block_pos_y + block_pos_h < precomputed.H - precomputed.padding and block_pos_x >= precomputed.padding:
                 draw.text((block_pos_x, block_pos_y), block_position_text, font=bottom_font, fill=blended)
 
-    # 正上方：编码信息
+    # ---------- 正上方：编码信息 ----------
     if show_encoding:
         utf8_text = f"UTF-8: {get_utf8_encoding(cp)}"
         utf16le_text = f"UTF-16LE: {get_utf16le_encoding(cp)}"
@@ -319,39 +464,48 @@ def generate_image_bytes(
 
         if encoding_y + total_height < precomputed.center_y - precomputed.middle_font_size:
             draw.text((encoding_x, encoding_y), utf8_text, font=bottom_font, fill=blended)
-            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height), utf16le_text, font=bottom_font,
-                      fill=blended)
-            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height * 2), utf16be_text, font=bottom_font,
-                      fill=blended)
+            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height), utf16le_text, font=bottom_font, fill=blended)
+            draw.text((encoding_x, encoding_y + precomputed.encoding_line_height * 2), utf16be_text, font=bottom_font, fill=blended)
 
-    # 底部左侧信息
-    font_file_name = get_font_display_name(font_path_key, cfg)
-    max_w = precomputed.W // 3
-    fname = truncate_text_to_width(draw, font_file_name, max_w, bottom_font)
+    # ---------- 动态计算底部布局（根据字体数量调整）----------
+    if is_multi_font and is_compare_mode:
+        font_display_names = [Path(p).name for p in font_paths]
+        font_line_count = len(font_display_names)
+    else:
+        if is_control:
+            font_path_key = 'ctrl'
+        else:
+            font_path_str = font_paths[0] if font_paths else str(cfg.font_files[0])
+            font_path_key = Path(font_path_str)
+        font_display_names = [get_font_display_name(font_path_key, cfg)]
+        font_line_count = 1
 
-    # 字体名位置
-    font_name_x, font_name_y = precomputed.font_name_pos
-    if position_animator and animated_elements and 'font' in animated_elements:
-        font_name_x, font_name_y = position_animator.get_position_offset(
-            gradient_index, font_name_x, font_name_y, 'font'
-        )
+    base_font_y = precomputed.font_name_y
+    line_height = precomputed.bottom_font_size + precomputed.line_spacing
 
-    fname_bbox = draw.textbbox((0, 0), fname, font=bottom_font)
-    fname_w = fname_bbox[2] - fname_bbox[0]
-    fname_h = fname_bbox[3] - fname_bbox[1]
-    fname_w = max(1, fname_w)
-    fname_h = max(1, fname_h)
+    # 绘制字体名称（从下往上）
+    for i, display_name in enumerate(font_display_names):
+        max_w = precomputed.W // 3
+        fname = truncate_text_to_width(draw, display_name, max_w, bottom_font)
+        font_name_x = precomputed.padding
+        current_font_y = base_font_y - i * line_height
 
-    font_name_x, font_name_y = check_bounds_with_padding(
-        font_name_x, font_name_y, fname_w, fname_h,
-        precomputed.padding, precomputed.W, precomputed.H
-    )
-    draw.text((font_name_x, font_name_y), fname, font=bottom_font, fill=blended)
+        if position_animator and animated_elements and 'font' in animated_elements:
+            anim_offset = position_animator.get_position_offset(
+                gradient_index + i * 5, 0, 0, 'font'
+            )
+            font_name_x += anim_offset[0]
+            current_font_y += anim_offset[1]
 
-    # 区块名位置
+        if current_font_y >= precomputed.padding:
+            draw.text((font_name_x, current_font_y), fname, font=bottom_font, fill=blended)
+
+    # 计算区块名的 Y 坐标（在所有字体名称之上）
+    top_font_y = base_font_y - (font_line_count - 1) * line_height
+    block_name_y = top_font_y - precomputed.bottom_font_size - precomputed.line_spacing
+    block_name_x = precomputed.block_name_pos[0]
+
     block_name = find_block_name(cp, blocks) if blocks else 'No_Block'
-    block_name_x, block_name_y = precomputed.block_name_pos
-
     block_bbox = draw.textbbox((0, 0), block_name, font=bottom_font)
     block_w = block_bbox[2] - block_bbox[0]
     block_h = block_bbox[3] - block_bbox[1]
@@ -369,7 +523,15 @@ def generate_image_bytes(
     )
     draw.text((block_name_x, block_name_y), block_name, font=bottom_font, fill=blended)
 
-    # 右下角NamesList信息
+    # 动态调整进度条结束位置
+    dynamic_progress_end_y = block_name_y - precomputed.line_spacing
+    if dynamic_progress_end_y > precomputed.progress_start_y:
+        progress_end_y = dynamic_progress_end_y
+    else:
+        progress_end_y = precomputed.progress_start_y + 10
+    progress_actual_height = progress_end_y - precomputed.progress_start_y
+
+    # ---------- 右下角 NamesList 信息 ----------
     info_start_x = precomputed.W - precomputed.info_max_width - precomputed.padding
     info_height = 0
 
@@ -386,13 +548,10 @@ def generate_image_bytes(
                 line = line.strip()
                 if not line:
                     continue
-
                 while line.startswith('\t') or line.startswith(' '):
                     line = line[1:]
-
                 if not line:
                     continue
-
                 lines_needed = calculate_lines_needed(line, precomputed.info_max_width, bottom_font)
                 total_lines_needed += lines_needed
                 lines_to_show.append((line, lines_needed))
@@ -412,11 +571,9 @@ def generate_image_bytes(
                         total_display_height = sum(l[1] for l in lines_to_show) * precomputed.info_line_height
                         start_y = precomputed.info_bottom_y - total_display_height
 
-                info_start_x = max(precomputed.padding,
-                                   min(info_start_x, precomputed.W - precomputed.padding - precomputed.info_max_width))
+                info_start_x = max(precomputed.padding, min(info_start_x, precomputed.W - precomputed.padding - precomputed.info_max_width))
 
                 current_y = start_y
-
                 for line_text, lines_needed in lines_to_show:
                     end_y = render_info_text_simple(
                         draw=draw,
@@ -430,20 +587,17 @@ def generate_image_bytes(
                     )
                     current_y = end_y + precomputed.info_line_height
 
-    # ========== 左右竖进度条 ==========
+    # ---------- 左右竖进度条 ----------
     if show_block_progress_bar or show_global_progress_bar:
-        # 计算进度值
         block_progress_val = index_in_block / total_in_block if total_in_block > 0 else 0
         global_progress_val = (global_index + 1) / total_entries if total_entries > 0 else 0
 
-        # 左侧进度条（区块进度）
         if show_block_progress_bar and total_in_block > 0 and index_in_block > 0:
-            # 渲染左侧竖进度条
             render_vertical_progress_bar(
                 draw=draw,
                 x=precomputed.left_progress_x,
                 y_start=precomputed.progress_start_y,
-                y_end=precomputed.progress_end_y,
+                y_end=progress_end_y,
                 width=precomputed.progress_bar_width,
                 progress=block_progress_val,
                 fg_color=blended,
@@ -451,33 +605,23 @@ def generate_image_bytes(
                 is_left=True
             )
 
-            # 左侧百分比文本 - 放在进度条右侧
             percent_text = f"{block_progress_val * 100:.1f}%"
             percent_x = precomputed.left_progress_x + precomputed.progress_bar_width + precomputed.percent_spacing
-
-            # 垂直居中显示百分比（与进度条位置对应）
             percent_bbox = draw.textbbox((0, 0), percent_text, font=bottom_font)
             percent_height = percent_bbox[3] - percent_bbox[1]
 
-            # 计算百分比文本的Y位置，使其与当前进度位置对应
-            # 进度百分比位置：从底部向上计算
-            progress_y = precomputed.progress_end_y - int(block_progress_val * precomputed.progress_actual_height)
+            progress_y = progress_end_y - int(block_progress_val * progress_actual_height)
             percent_y = progress_y - percent_height // 2
-
-            # 确保不超出进度条区域
-            percent_y = max(precomputed.progress_start_y,
-                            min(percent_y, precomputed.progress_end_y - percent_height))
+            percent_y = max(precomputed.progress_start_y, min(percent_y, progress_end_y - percent_height))
 
             draw.text((percent_x, percent_y), percent_text, font=bottom_font, fill=blended)
 
-        # 右侧进度条（全局进度）
         if show_global_progress_bar and total_entries > 0:
-            # 渲染右侧竖进度条
             render_vertical_progress_bar(
                 draw=draw,
                 x=precomputed.right_progress_x,
                 y_start=precomputed.progress_start_y,
-                y_end=precomputed.progress_end_y,
+                y_end=progress_end_y,
                 width=precomputed.progress_bar_width,
                 progress=global_progress_val,
                 fg_color=blended,
@@ -485,40 +629,34 @@ def generate_image_bytes(
                 is_left=False
             )
 
-            # 右侧百分比文本 - 放在进度条左侧
             percent_text = f"{global_progress_val * 100:.1f}%"
             percent_bbox = draw.textbbox((0, 0), percent_text, font=bottom_font)
             percent_width = percent_bbox[2] - percent_bbox[0]
             percent_height = percent_bbox[3] - percent_bbox[1]
 
             percent_x = precomputed.right_progress_x - percent_width - precomputed.percent_spacing
-
-            # 计算百分比文本的Y位置，使其与当前进度位置对应
-            progress_y = precomputed.progress_end_y - int(global_progress_val * precomputed.progress_actual_height)
+            progress_y = progress_end_y - int(global_progress_val * progress_actual_height)
             percent_y = progress_y - percent_height // 2
+            percent_y = max(precomputed.progress_start_y, min(percent_y, progress_end_y - percent_height))
 
-            # 确保不超出进度条区域
-            percent_y = max(precomputed.progress_start_y,
-                            min(percent_y, precomputed.progress_end_y - percent_height))
-
-            # 确保百分比文本不超出左边界
             if percent_x >= precomputed.padding:
                 draw.text((percent_x, percent_y), percent_text, font=bottom_font, fill=blended)
 
-    # ========== 底部转圈加载（字符串切换，整体居中） ==========
+    # ---------- 底部转圈动画 ----------
     if show_side_spinner and spinner_strings:
-        # 渲染底部转圈圈字符串（在多个完整字符串之间切换）
+        spinner_y = top_font_y - precomputed.line_spacing * 2
         render_spinner_string_at_bottom(
             draw=draw,
             spinner_strings=spinner_strings,
             step=spinner_step,
             start_x=precomputed.spinner_start_x,
             end_x=precomputed.spinner_end_x,
-            y=precomputed.spinner_y,
+            y=spinner_y,
             font=bottom_font,
             color=blended
         )
 
+    # ---------- 保存图片 ----------
     buf = BytesIO()
     buf.truncate(50000)
     buf.seek(0)
@@ -704,27 +842,19 @@ def parse_args():
 
 def main():
     args = parse_args()
-
     random.seed()
-
     setup_logging()
 
-    # 解析转圈字符串列表
     spinner_strings = [s.strip() for s in args.spinner_strings.split(',')]
     logging.info(f"转圈字符串列表: {spinner_strings}")
 
-    # 加载基础配置
     base_cfg = Config()
-
-    # 应用缩放因子
     scale_factor = args.scale
     if scale_factor <= 0:
         logging.error("缩放因子必须大于0，使用默认值1.0")
         scale_factor = 1.0
 
-    # 创建缩放后的配置
     cfg = ScaledConfig(base_cfg, scale_factor)
-
     cfg.output_dir.mkdir(exist_ok=True)
 
     if args.png_quality == 'fast':
@@ -761,7 +891,6 @@ def main():
         logging.info("所有图片已存在，无需生成")
         return
 
-    # 加载Unicode数据
     unicode_data_path = Path.cwd() / 'UnicodeData.txt'
     if unicode_data_path.exists():
         combining_cps = load_combining_marks(unicode_data_path)
@@ -774,7 +903,6 @@ def main():
 
     overlay_enabled = not args.disable_comb_overlay
 
-    # 加载Unicode区块
     blocks_path = Path.cwd() / 'UnicodeBlocks.txt'
     if blocks_path.exists():
         blocks = load_unicode_blocks(blocks_path)
@@ -785,11 +913,9 @@ def main():
         block_index_mapping = {}
         logging.warning("UnicodeBlocks.txt 未找到，区块名称显示为 No_Block")
 
-    # 加载NamesList
     names_list_path = Path.cwd() / 'NamesList.txt'
     names_list_parser = NamesListParser(names_list_path)
 
-    # 颜色相关设置
     gradient_manager = None
     if args.rainbow_gradient:
         if args.gradient_colors:
@@ -814,8 +940,7 @@ def main():
         colors = parse_color_list(args.flash_color)
         if colors:
             flash_color = colors[0]
-            logging.info(
-                f"使用闪出颜色: R={flash_color[0]}, G={flash_color[1]}, B={flash_color[2]}, A={flash_color[3]}")
+            logging.info(f"使用闪出颜色: R={flash_color[0]}, G={flash_color[1]}, B={flash_color[2]}, A={flash_color[3]}")
         else:
             flash_color = get_random_color()
             logging.info("使用随机闪出颜色")
@@ -825,7 +950,6 @@ def main():
         flash_color = get_random_color()
         logging.info("使用随机闪出颜色")
 
-    # 动画设置
     animated_elements = []
     if args.animate_elements:
         animated_elements = [elem.strip() for elem in args.animate_elements.split(',')]
@@ -843,11 +967,9 @@ def main():
             speed=args.animation_speed,
             movement_speed=args.movement_speed
         )
-        logging.info(
-            f"动画设置: 类型={args.animation_type}, 幅度={int(args.animation_amplitude * scale_factor)}, 飘动速度={args.movement_speed}")
+        logging.info(f"动画设置: 类型={args.animation_type}, 幅度={int(args.animation_amplitude * scale_factor)}, 飘动速度={args.movement_speed}")
         logging.info(f"颜色变化速度系数: {args.animation_speed}")
 
-    # 内容位置设置
     content_position_type, content_position_value = parse_content_position(args.content_position)
     content_position_random = (content_position_type == 'random')
     content_position_fixed = content_position_value if content_position_type == 'fixed' else None
@@ -863,10 +985,8 @@ def main():
     elif content_position_fixed:
         logging.info(f"内容位置: 固定位置 ({content_position_fixed[0]}, {content_position_fixed[1]})")
 
-    # 预计算值
     precomputed = PrecomputedValues(cfg, scale_factor)
 
-    # 颜色管理器
     color_mgr = None
     if args.random_color and not gradient_manager and not flash_color:
         logging.info("启用完全随机颜色模式")
@@ -900,11 +1020,8 @@ def main():
             logging.info(f"固定背景: {cfg.background_color}")
         blend_cache, overlay_cache = precompute_blend_colors(cfg, [cfg.background_color])
 
-    logging.info(
-        f"需要生成 {len(to_process)} 张图片 (workers={args.workers}, png-quality={args.png_quality}, "
-        f"scale={scale_factor:.2f}, 最终分辨率: {cfg.image_size[0]}x{cfg.image_size[1]})")
+    logging.info(f"需要生成 {len(to_process)} 张图片 (workers={args.workers}, png-quality={args.png_quality}, scale={scale_factor:.2f}, 最终分辨率: {cfg.image_size[0]}x{cfg.image_size[1]})")
 
-    # 记录新增功能启用状态
     if args.show_encoding:
         logging.info("启用编码信息显示（UTF-8、UTF-16LE、UTF-16BE）")
     if args.show_block_position:
@@ -918,7 +1035,6 @@ def main():
     if args.show_side_spinner:
         logging.info(f"启用转圈圈动画，字符串列表: {spinner_strings}，切换间隔: {args.spinner_step_interval}张")
 
-    # 加载字体
     bottom_font = ImageFont.truetype(str(cfg.bottom_font_file), cfg.bottom_font_size)
     try:
         ctrl_font = ImageFont.truetype(str(cfg.ctrl_font_file), cfg.middle_font_size)
@@ -931,7 +1047,6 @@ def main():
     text_cache: dict[str, tuple[int, int]] = {}
     overlay_bbox_cache: dict[str, tuple[int, int]] = {}
 
-    # 启动写入线程
     q: Queue = Queue(maxsize=200)
     writer = Thread(target=optimized_writer_thread_fn, args=(q,), daemon=True)
     writer.start()
@@ -954,13 +1069,11 @@ def main():
 
             color_index = gradient_index * args.animation_speed
 
-            # 获取区块内进度信息
             index_in_block = 0
             total_in_block = 0
             if block_index_mapping and entry.code_str in block_index_mapping:
                 index_in_block, total_in_block = block_index_mapping[entry.code_str]
 
-            # 计算转圈圈步骤
             spinner_step = (i // args.spinner_step_interval) % len(spinner_strings)
 
             future = pool.submit(

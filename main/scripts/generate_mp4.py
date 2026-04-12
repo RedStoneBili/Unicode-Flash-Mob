@@ -8,54 +8,67 @@ import re
 import sys
 import logging
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from Module import Config, setup_logging
+from Module import Config, setup_logging, load_unicode_entries, load_unicode_blocks, ChapterGenerator
+
+base_dir = os.path.dirname(os.path.abspath(__file__))
+os.chdir(base_dir)
+
 
 def find_ffmpeg():
     ffmpeg_exe = "ffmpeg.exe" if platform.system() == "Windows" else "ffmpeg"
 
-    search_paths = [
-        (os.path.join(path, ffmpeg_exe) for path in os.environ.get("PATH", "").split(os.pathsep)),
-        [os.path.abspath(os.path.join(".", "ffmpeg", "bin", ffmpeg_exe))],
-        [os.path.join(root, ffmpeg_exe) for root, _, files in os.walk(".") if ffmpeg_exe in files]
-    ]
-
-    for ffmpeg_path in (p for group in search_paths for p in group):
+    for path in os.environ.get("PATH", "").split(os.pathsep):
+        ffmpeg_path = os.path.join(path, ffmpeg_exe)
         if os.path.exists(ffmpeg_path):
-            logging.info(f"\n找到 {ffmpeg_exe} 文件\n在：{ffmpeg_path}\n")
+            logging.info(f"\n从环境变量中找到 {ffmpeg_exe} 文件\n在：{ffmpeg_path}\n")
+            return ffmpeg_path
+
+    local_ffmpeg_path = os.path.abspath(os.path.join(".", "ffmpeg", "bin", ffmpeg_exe))
+    if os.path.exists(local_ffmpeg_path):
+        logging.info(f"\n在当前目录下找到 {ffmpeg_exe} 文件\n在：{local_ffmpeg_path}\n")
+        return local_ffmpeg_path
+
+    for root, dirs, files in os.walk("."):
+        if ffmpeg_exe in files:
+            ffmpeg_path = os.path.abspath(os.path.join(root, ffmpeg_exe))
+            logging.info(f"\n在当前目录搜索中找到 {ffmpeg_exe} 文件\n在：{ffmpeg_path}\n")
             return ffmpeg_path
 
     logging.error(f"\n未找到 {ffmpeg_exe} 文件")
     logging.info("请确保已安装 ffmpeg 并添加到环境变量，或将 ffmpeg 放在当前目录的 ffmpeg/bin/ 文件夹中")
     sys.exit(1)
 
+
 def convert_images_to_video(image_folder, output_file, frame_rate, file_list):
     ffmpeg_path = find_ffmpeg()
-    image_duration = 1.0 / frame_rate
 
-    with tempfile.NamedTemporaryFile(mode='w', prefix='ffmpeg_concat_', suffix='.txt', delete=False) as temp_file:
-        temp_file_name = temp_file.name
-        for image_file in file_list:
-            temp_file.write(f"file '{os.path.join(image_folder, image_file).replace('\\', '/')}'\n")
-            temp_file.write(f"duration {image_duration}\n")
-        if file_list:
-            temp_file.write(f"file '{os.path.join(image_folder, file_list[-1])}'\n")
-
+    fd, temp_file = tempfile.mkstemp(prefix='ffmpeg_concat_', suffix='.txt', text=True)
+    os.close(fd)
     try:
+        with open(temp_file, 'w', encoding='utf-8') as file:
+            image_duration = 1.0 / frame_rate
+            for image_file in file_list:
+                file.write(f"file '{os.path.join(image_folder, image_file).replace('\\', '/')}'\n")
+                file.write(f"duration {image_duration}\n")
+
+            if file_list:
+                file.write(f"file '{os.path.join(image_folder, file_list[-1])}'\n")
+
         ffmpeg_command = [
             ffmpeg_path, '-y', '-r', str(frame_rate), '-f', 'concat', '-safe', '0',
-            '-i', temp_file_name, '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
+            '-i', temp_file, '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
             '-pix_fmt', 'yuv420p', '-fflags', '+genpts+discardcorrupt', '-vsync', 'vfr',
             '-avoid_negative_ts', 'make_zero', '-threads', str(os.cpu_count() or 4), output_file
         ]
 
+
         logging.info(f"开始转换视频，共 {len(file_list)} 张图片...")
-        logging.info(f"使用 {os.cpu_count() or 4} 个线程进行编码")
         process = subprocess.Popen(ffmpeg_command)
         process.wait()
-
         if process.returncode == 0:
             logging.info("视频转换完成！")
         else:
@@ -64,16 +77,17 @@ def convert_images_to_video(image_folder, output_file, frame_rate, file_list):
     except Exception as e:
         logging.exception(f"转换过程中出现异常：{e}")
     finally:
-        if os.path.exists(temp_file_name):
-            os.remove(temp_file_name)
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
     return ffmpeg_path
+
 
 def add_music_to_video(video_file, music_file, output_file, ffmpeg_path):
     if not os.path.exists(music_file):
         logging.warning(f"音乐文件不存在：{music_file}")
         return False
-        
+
     ffmpeg_command = [
         ffmpeg_path,
         '-y',
@@ -95,6 +109,48 @@ def add_music_to_video(video_file, music_file, output_file, ffmpeg_path):
         logging.error(f"添加音乐时出现错误：\n{e.stderr}")
         return False
 
+
+def generate_chapter_file(entries, blocks, frame_rate, output_dir, video_name):
+    if not blocks or not entries:
+        logging.warning("没有区块信息或条目信息，无法生成章节文件")
+        return False
+
+    # 创建章节生成器（不强制最小间隔，使用真实时间）
+    chapter_gen = ChapterGenerator(min_seconds=0)
+
+    # 按区块生成章节 - 使用每个区块第一个字符的真实时间
+    chapters = chapter_gen.generate_chapters_by_blocks(
+        blocks=blocks,
+        entries=entries,
+        frame_rate=frame_rate,
+        chapter_name_template="{block_name}"
+    )
+
+    if chapters:
+        # 打印章节信息
+        logging.info("生成的章节列表（起始时间）：")
+        for i, (time_point, name) in enumerate(chapters):
+            time_str = chapter_gen.seconds_to_time_str(time_point)
+            # 计算这个章节的持续时间（到下一个章节开始）
+            if i < len(chapters) - 1:
+                next_time = chapters[i + 1][0]
+                duration = next_time - time_point
+                logging.info(f"  {i + 1}. {time_str} {name} (持续 {duration:.2f}秒)")
+            else:
+                total_duration = len(entries) / frame_rate
+                duration = total_duration - time_point
+                logging.info(f"  {i + 1}. {time_str} {name} (持续 {duration:.2f}秒到最后)")
+
+        chapter_path = Path(output_dir) / f"{video_name}.txt"
+        chapter_gen.save_chapter_file(chapters, chapter_path)
+
+        logging.info(f"章节文件已生成: {chapter_path}")
+        return True
+    else:
+        logging.warning("没有生成任何章节")
+        return False
+
+
 def get_output_video_name():
     while True:
         output_file_name = input("请输入输出视频的名称：").strip().lstrip('\ufeff')
@@ -114,19 +170,13 @@ def get_output_video_name():
         else:
             return output_file_name
 
-def parse_unicode_filename(filename: str) -> tuple[bool, int, str]:
-    clean_name = filename.lstrip('\ufeff')
-    match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', clean_name)
-    if match:
-        return True, int(match.group(1), 16), filename
-    return False, 0, filename
 
 def get_frame_rate():
     while True:
         frame_rate_input = input("请输入视频的帧率（帧/秒，默认30）：").strip()
         if not frame_rate_input:
             return 30.0
-            
+
         try:
             frame_rate = float(frame_rate_input)
             if frame_rate <= 0:
@@ -136,35 +186,6 @@ def get_frame_rate():
         except ValueError:
             logging.warning("无效的输入，请输入一个数字。")
 
-def cleanup_png_files(input_folder: str, confirm: bool = True) -> int:
-    if not os.path.exists(input_folder):
-        return 0
-
-    png_files = [f for f in os.listdir(input_folder) if f.lower().endswith('.png')]
-    if not png_files:
-        logging.info("没有找到PNG文件需要清理")
-        return 0
-
-    total_size = sum(os.path.getsize(os.path.join(input_folder, f)) for f in png_files)
-    size_mb = total_size / (1024 * 1024)
-    logging.info(f"发现 {len(png_files)} 个PNG文件，占用 {size_mb:.2f} MB")
-
-    if confirm:
-        choice = input("是否清理这些中间PNG文件？(y/n): ").strip().lower()
-        if choice != 'y':
-            logging.info("跳过清理")
-            return 0
-
-    deleted_count = 0
-    for f in png_files:
-        try:
-            os.remove(os.path.join(input_folder, f))
-            deleted_count += 1
-        except OSError:
-            pass
-
-    logging.info(f"已清理 {deleted_count} 个PNG文件，释放 {size_mb:.2f} MB 磁盘空间")
-    return deleted_count
 
 def main():
     setup_logging()
@@ -181,7 +202,7 @@ def main():
         logging.error(f"图片文件夹不存在：{input_folder}")
         sys.exit(1)
 
-    output_dir = 'output'
+    output_dir = os.path.abspath(os.path.join(runtime_dir, 'output'))
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         logging.info(f"创建输出文件夹：{output_dir}")
@@ -191,6 +212,7 @@ def main():
     logging.info(f"\n输出文件名: {output_file_name}")
     logging.info(f"帧率: {frame_rate}")
 
+    # 读取图片文件
     image_files = sorted(
         f for f in os.listdir(input_folder)
         if f.lower().endswith(('.png'))
@@ -201,25 +223,57 @@ def main():
 
     logging.info(f"找到 {len(image_files)} 个PNG文件")
 
+    # 解析文件名获取Unicode值
     valid_files = []
+    entries = []
+
     for file_name in image_files:
-        success, unicode_value, _ = parse_unicode_filename(file_name)
-        if success:
-            valid_files.append((unicode_value, file_name))
-        else:
-            logging.warning(f"警告：文件名格式不符合要求，跳过：{file_name}")
+        try:
+            clean_name = file_name.lstrip('\ufeff')
+            match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', clean_name)
+            if match:
+                unicode_value = int(match.group(1), 16)
+                valid_files.append((unicode_value, file_name))
+
+                from Module import UnicodeEntry
+                code_str = f"U+{match.group(1).upper()}"
+                entries.append(UnicodeEntry(
+                    font_path=Path(""),
+                    code_str=code_str,
+                    description=""
+                ))
+            else:
+                logging.warning(f"警告：文件名格式不符合要求，跳过：{file_name}")
+        except ValueError as e:
+            logging.error(f"处理文件 {file_name} 时出错：{e}")
 
     if not valid_files:
         logging.warning("没有找到符合命名规则的PNG文件")
         sys.exit(1)
 
+    # 按Unicode值排序
     valid_files.sort(key=lambda x: x[0])
     sorted_image_files = [f[1] for f in valid_files]
+
+    # 同时确保entries也是按相同顺序排序
+    entries.sort(key=lambda x: int(x.code_str[2:], 16))
+
     logging.info(f"有效文件：{len(sorted_image_files)} 个")
 
+    # 生成视频
     output_file = os.path.join(output_dir, output_file_name + '.mp4')
     ffmpeg_path = convert_images_to_video(input_folder, output_file, frame_rate, sorted_image_files)
 
+    blocks_path = Path.cwd() / 'UnicodeBlocks.txt'
+    if blocks_path.exists():
+        blocks = load_unicode_blocks(blocks_path)
+        logging.info(f"加载 {len(blocks)} 个 Unicode blocks")
+
+        generate_chapter_file(entries, blocks, frame_rate, output_dir, output_file_name)
+    else:
+        logging.warning("UnicodeBlocks.txt 未找到，无法生成章节文件")
+
+    # 添加音乐
     add_music_choice = input("\n是否要为视频添加音乐? (y/n): ").strip().lower()
     if add_music_choice == 'y':
         music_file = cfg.music_file
@@ -238,11 +292,6 @@ def main():
 
     logging.info(f"\n视频已保存为: {output_file}")
 
-    cleanup_choice = input("\n是否清理中间PNG文件以释放磁盘空间？(y/n): ").strip().lower()
-    if cleanup_choice == 'y':
-        cleanup_png_files(input_folder, confirm=False)
-    else:
-        logging.info("保留中间PNG文件")
 
 if __name__ == "__main__":
     try:

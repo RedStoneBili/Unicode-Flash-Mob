@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import List
 import os
 
 # 导入新创建的模块
@@ -38,6 +39,8 @@ from file_utils import (
     create_filename_mapping, parse_content_position
 )
 
+from chapter_generator import ChapterGenerator, create_chapters_from_blocks
+
 
 @dataclass
 class Config:
@@ -50,7 +53,7 @@ class Config:
     middle_font_size: int = 512
     bottom_font_size: int = 19
     text_position: tuple[int, int] = (0, 0)  # (text_position_x, text_position_y)
-    middle_font_color: tuple[int, int, int, int] = (255, 255, 255, 255)
+    middle_font_color: tuple[int, int, int, int] = (20, 20, 20, 200)
     image_size: tuple[int, int] = (1920, 1080)
     background_color: tuple[int, int, int, int] = (0, 0, 0, 255)
     color_cycle: list[tuple[int, int, int, int]] = None
@@ -97,9 +100,16 @@ class Config:
 
 @dataclass
 class UnicodeEntry:
-    font_path: Path
+    font_path: str
     code_str: str
     description: str
+    
+    def get_font_paths(self) -> List[str]:
+        return self.font_path.split('|')
+    
+    def has_multiple_fonts(self) -> bool:
+        return '|' in self.font_path
+
 
 
 class ColorManager:
@@ -289,11 +299,6 @@ class ColorManager:
 
 
 def load_unicode_entries(path: Path) -> list[UnicodeEntry]:
-    """
-    读取新的 Unicode.txt 格式，每行格式：
-      "font_path";"U+xxxx";"Description"
-    去除空行，拆分三段，去除两端引号后返回 UnicodeEntry 列表。
-    """
     entries: list[UnicodeEntry] = []
 
     content = path.read_text(encoding='utf-8')
@@ -314,10 +319,9 @@ def load_unicode_entries(path: Path) -> list[UnicodeEntry]:
         code_str = parts[1].strip().strip('"')
         desc = parts[2].strip().strip('"')
 
-        entries.append(UnicodeEntry(Path(font_path), code_str, desc))
+        entries.append(UnicodeEntry(font_path, code_str, desc))
 
     return entries
-
 
 def setup_logging():
     if not logging.getLogger().handlers:
@@ -368,3 +372,5 @@ def blend_colors(fg: tuple[int, int, int], bg: tuple[int, int, int], alpha: floa
         int(fg[1] * alpha + bg[1] * inv_alpha),
         int(fg[2] * alpha + bg[2] * inv_alpha)
     )
+
+

@@ -29,6 +29,12 @@ enum Commands {
 
         #[arg(short, long, value_name = "OUT_FILE")]
         out: Option<PathBuf>,
+        
+        #[arg(long, value_name = "MODE", default_value = "any")]
+        mode: String,
+
+        #[arg(long, value_name = "STYLE", default_value = "fallback")]
+        style: String,
     },
     Replace {
         #[arg(value_name = "MODE")]
@@ -36,40 +42,160 @@ enum Commands {
     },
 }
 
-pub fn extract_unicode_from_fonts(font_paths: &[PathBuf], out_file: Option<&Path>) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExtractMode {
+    Any,
+    All,
+}
+
+impl ExtractMode {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "any" => Ok(ExtractMode::Any),
+            "all" => Ok(ExtractMode::All),
+            _ => bail!("无效模式：{}，仅支持 any 或 all", s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FontStyle {
+    Fallback,
+    Compare,
+}
+
+impl FontStyle {
+    pub fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "fallback" => Ok(FontStyle::Fallback),
+            "compare" => Ok(FontStyle::Compare),
+            _ => bail!("无效样式：{}，仅支持 fallback 或 compare", s),
+        }
+    }
+}
+
+struct FontInfo {
+    path: PathBuf,
+    face: Face<'static>,
+    data: Vec<u8>,
+    supported: HashSet<u32>,
+}
+
+impl FontInfo {
+    fn load(path: &Path) -> Result<Self> {
+        let data = fs::read(path)
+            .with_context(|| format!("无法读取字体文件：{:?}", path))?;
+
+        let data_leaked = Box::leak(data.clone().into_boxed_slice());
+        let face = Face::parse(data_leaked, 0)
+            .with_context(|| format!("解析字体失败（{:?} 不是有效的 TTF/OTF）", path))?;
+
+        let mut supported = HashSet::new();
+        for cp in 0..=0x10FFFF {
+            if let Some(ch) = std::char::from_u32(cp) {
+                if face.glyph_index(ch).is_some() {
+                    supported.insert(cp);
+                }
+            }
+        }
+
+        Ok(FontInfo {
+            path: path.to_path_buf(),
+            face,
+            data,
+            supported,
+        })
+    }
+
+    fn supports(&self, cp: u32) -> bool {
+        self.supported.contains(&cp)
+    }
+
+    fn name(&self) -> String {
+        self.path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.path.to_string_lossy().to_string())
+    }
+}
+
+pub fn extract_unicode_from_fonts(
+    font_paths: &[PathBuf],
+    out_file: Option<&Path>,
+    mode: ExtractMode,
+    style: FontStyle,
+) -> Result<()> {
     let out_path = out_file
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| PathBuf::from("combined_unicode_list.txt"));
 
+    println!("加载字体文件...");
+    let mut fonts = Vec::new();
+    for path in font_paths {
+        match FontInfo::load(path) {
+            Ok(info) => {
+                println!("  ✓ {} (支持 {} 个字符)", info.name(), info.supported.len());
+                fonts.push(info);
+            }
+            Err(e) => {
+                eprintln!("  ✗ 加载失败 {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    if fonts.is_empty() {
+        bail!("没有成功加载任何字体");
+    }
+
+    println!("\n收集字符码位 (模式: {}, 样式: {})...",
+        if mode == ExtractMode::Any { "任一字体支持" } else { "全部字体支持" },
+        if style == FontStyle::Compare { "对比" } else { "回退" }
+    );
+
+    let mut codepoints: Vec<u32> = (0..=0x10FFFF)
+        .filter(|&cp| {
+            if mode == ExtractMode::Any {
+                fonts.iter().any(|f| f.supports(cp))
+            } else {
+                fonts.iter().all(|f| f.supports(cp))
+            }
+        })
+        .collect();
+
+    codepoints.sort();
+
+    println!("共收集 {} 个字符", codepoints.len());
+
+    println!("\n写入文件: {}", out_path.display());
     let file = File::create(&out_path)
         .with_context(|| format!("无法创建输出文件：{:?}", out_path))?;
     let mut writer = BufWriter::new(file);
 
-    let mut seen = HashSet::new();
-    let mut total = 0;
+    match style {
+        FontStyle::Compare => {
+            // 对比模式：用 | 分隔所有字体，Python 端会并排显示
+            let font_names: Vec<String> = fonts.iter().map(|f| f.name()).collect();
+            let font_list_str = font_names.join("|");
 
-    for font_path in font_paths {
-        let data = fs::read(font_path)
-            .with_context(|| format!("无法读取字体文件：{:?}", font_path))?;
-        let face = Face::parse(&data, 0)
-            .with_context(|| format!("解析字体失败（{:?} 不是有效的 TTF/OTF）", font_path))?;
+            for &cp in &codepoints {
+                writeln!(writer, "\"{}\";\"U+{:04X}\"", font_list_str, cp)?;
+            }
+        }
+        FontStyle::Fallback => {
+            // 回退模式：为每个字符选择第一个支持它的字体
+            for &cp in &codepoints {
+                let selected_font = fonts.iter()
+                    .find(|f| f.supports(cp))
+                    .map(|f| f.name())
+                    .unwrap_or_else(|| fonts[0].name());
 
-        let label = font_path.to_string_lossy();
-        for cp in 0..=0x10FFFF {
-            if let Some(ch) = std::char::from_u32(cp) {
-                if face.glyph_index(ch).is_some() && seen.insert(cp) {
-                    writeln!(writer, "\"{}\";\"U+{:04X}\"", label, cp)?;
-                    total += 1;
-                }
+                writeln!(writer, "\"{}\";\"U+{:04X}\"", selected_font, cp)?;
             }
         }
     }
+
     writer.flush().context("写入缓冲区失败")?;
 
-    println!(
-        "已提取 {} 个映射的 Unicode 码位，输出到：{:?}",
-        total, out_path
-    );
+    println!("完成！");
     Ok(())
 }
 
@@ -148,58 +274,60 @@ fn replace_content(
 ) -> Result<()> {
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
-    let re = Regex::new(r#""(U\+[0-9A-Fa-f]{4,6})""#).unwrap();
+    let re = Regex::new(r#""([^"]+)";"(U\+[0-9A-Fa-f]{4,6})""#).unwrap();
 
     let mut output = Vec::new();
     for line in reader.lines() {
         let line = line?;
-        let replaced = re.replace_all(&line, |caps: &regex::Captures| {
-            let code = &caps[1];
+
+        let replaced = if let Some(caps) = re.captures(&line) {
+            let fonts = &caps[1];
+            let code = &caps[2];
             let block_desc = blocks_map.get(code);
             let data_desc = data_map.get(code);
 
             match choice {
                 1 => {
-                    // 仅区块
                     if let Some(b) = block_desc {
-                        format!("\"{}\";\"{}\"", code, b)
+                        format!("\"{}\";\"{}\";\"{}\"", fonts, code, b)
                     } else {
-                        caps[0].to_string()
+                        format!("\"{}\";\"{}\";\"\"", fonts, code)
                     }
                 }
                 2 => {
-                    // 仅详细信息
                     if let Some(d) = data_desc {
-                        format!("\"{}\";\"{}\"", code, d)
+                        format!("\"{}\";\"{}\";\"{}\"", fonts, code, d)
                     } else {
-                        caps[0].to_string()
+                        format!("\"{}\";\"{}\";\"\"", fonts, code)
                     }
                 }
                 3 => {
-                    // 区块 | 详细
                     let b = block_desc.map(|s| s.as_str()).unwrap_or("");
                     let d = data_desc.map(|s| s.as_str()).unwrap_or("");
                     if !b.is_empty() || !d.is_empty() {
-                        format!("\"{}\";\"{}|{}\"", code, b, d)
+                        format!("\"{}\";\"{}\";\"{}|{}\"", fonts, code, b, d)
                     } else {
-                        caps[0].to_string()
+                        format!("\"{}\";\"{}\";\"\"", fonts, code)
                     }
                 }
-                _ => caps[0].to_string(),
+                _ => line.to_string(),
             }
-        });
-        output.push(replaced.to_string());
+        } else {
+            line
+        };
+        
+        output.push(replaced);
     }
 
-    // 对结果进行排序
     output.sort_by(|a, b| {
-        let code_a = re.captures(a)
+        let re_code = Regex::new(r#"U\+([0-9A-Fa-f]{4,6})"#).unwrap();
+        let code_a = re_code.captures(a)
             .and_then(|c| c.get(1))
-            .and_then(|m| u32::from_str_radix(&m.as_str()[2..], 16).ok())
+            .and_then(|m| u32::from_str_radix(m.as_str(), 16).ok())
             .unwrap_or(0);
-        let code_b = re.captures(b)
+        let code_b = re_code.captures(b)
             .and_then(|c| c.get(1))
-            .and_then(|m| u32::from_str_radix(&m.as_str()[2..], 16).ok())
+            .and_then(|m| u32::from_str_radix(m.as_str(), 16).ok())
             .unwrap_or(0);
         code_a.cmp(&code_b)
     });
