@@ -25,7 +25,7 @@ enum Commands {
     ProcessUnicodeData,
     Extract {
         #[arg(value_name = "FONT_FILES", required = true)]
-        font_files: Vec<PathBuf>,
+        font_files: Vec<String>,
         #[arg(short, long, value_name = "OUT_FILE")]
         out: Option<PathBuf>,
         #[arg(long, value_name = "MODE", default_value = "any")]

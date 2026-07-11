@@ -12,6 +12,7 @@ class ChapterGenerator:
         self.min_seconds = min_seconds
 
     def seconds_to_time_str(self, seconds: float) -> str:
+        """将秒数转换为 HH:MM:SS 格式"""
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)

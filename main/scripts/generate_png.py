@@ -1,3 +1,5 @@
+# generate_png.py (修改后的完整文件)
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -23,7 +25,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from control_map import get_char, CTRLS
 from Module import (
     Config, UnicodeEntry, ColorManager, load_unicode_entries, setup_logging,
-    # 新导入的模块
     ColorGradient, PositionAnimator, NamesListParser, PrecomputedValues, ScaledConfig,
     load_unicode_blocks, find_block_name, find_block_index, load_unicode_names,
     load_combining_marks, build_block_index_mapping, get_utf8_encoding,
@@ -123,7 +124,6 @@ def generate_image_bytes(
         if not random_color and not gradient_manager and not flash_color:
             blend_cache[bg_key] = blended
 
-    # ---------- 绘制主字符区域 ----------
     if is_multi_font and is_compare_mode:
         num_fonts = len(font_paths)
         precomputed.multi_font_total_width = num_fonts * precomputed.multi_font_slot_width + (num_fonts - 1) * precomputed.multi_font_spacing
@@ -132,7 +132,6 @@ def generate_image_bytes(
         current_x = start_x
 
         for i, font_path_str in enumerate(font_paths):
-            # 解析字体路径
             font_path = None
             font = None
             font_key = None
@@ -267,7 +266,6 @@ def generate_image_bytes(
 
         main_char_right_edge = start_x + total_width
     else:
-        # 单字体或回退模式
         if is_control:
             middle_font = ctrl_font
             font_path_key = 'ctrl'
@@ -276,6 +274,14 @@ def generate_image_bytes(
             font_path = Path(font_path_str)
             middle_font = middle_font_cache.get(font_path)
             font_path_key = font_path
+            if not middle_font:
+                try:
+                    middle_font = ImageFont.truetype(str(font_path), cfg.middle_font_size)
+                    middle_font_cache[font_path] = middle_font
+                    metrics_cache[font_path] = middle_font.getmetrics()
+                except Exception as e:
+                    logging.debug(f"直接加载字体失败 {font_path}: {e}")
+                    middle_font = None
             if not middle_font:
                 for p in cfg.font_files:
                     f = middle_font_cache.get(p)
@@ -366,7 +372,6 @@ def generate_image_bytes(
 
         draw.text((x, y), char, font=middle_font, fill=blended)
 
-    # ---------- 左上角：码位 ----------
     code_text = entry.code_str
     top_left_x, top_left_y = precomputed.top_left
 
@@ -398,7 +403,6 @@ def generate_image_bytes(
         if global_position_y + code_h < precomputed.H - precomputed.padding:
             draw.text((top_left_x, global_position_y), global_position_text, font=bottom_font, fill=blended)
 
-    # ---------- 右上角：字符名称 ----------
     name_text = ''
     if unicode_names and cp in unicode_names:
         name_text = unicode_names[cp]
@@ -441,7 +445,6 @@ def generate_image_bytes(
             if block_pos_y + block_pos_h < precomputed.H - precomputed.padding and block_pos_x >= precomputed.padding:
                 draw.text((block_pos_x, block_pos_y), block_position_text, font=bottom_font, fill=blended)
 
-    # ---------- 正上方：编码信息 ----------
     if show_encoding:
         utf8_text = f"UTF-8: {get_utf8_encoding(cp)}"
         utf16le_text = f"UTF-16LE: {get_utf16le_encoding(cp)}"
@@ -467,7 +470,6 @@ def generate_image_bytes(
             draw.text((encoding_x, encoding_y + precomputed.encoding_line_height), utf16le_text, font=bottom_font, fill=blended)
             draw.text((encoding_x, encoding_y + precomputed.encoding_line_height * 2), utf16be_text, font=bottom_font, fill=blended)
 
-    # ---------- 动态计算底部布局（根据字体数量调整）----------
     if is_multi_font and is_compare_mode:
         font_display_names = [Path(p).name for p in font_paths]
         font_line_count = len(font_display_names)
@@ -483,7 +485,6 @@ def generate_image_bytes(
     base_font_y = precomputed.font_name_y
     line_height = precomputed.bottom_font_size + precomputed.line_spacing
 
-    # 绘制字体名称（从下往上）
     for i, display_name in enumerate(font_display_names):
         max_w = precomputed.W // 3
         fname = truncate_text_to_width(draw, display_name, max_w, bottom_font)
@@ -500,7 +501,6 @@ def generate_image_bytes(
         if current_font_y >= precomputed.padding:
             draw.text((font_name_x, current_font_y), fname, font=bottom_font, fill=blended)
 
-    # 计算区块名的 Y 坐标（在所有字体名称之上）
     top_font_y = base_font_y - (font_line_count - 1) * line_height
     block_name_y = top_font_y - precomputed.bottom_font_size - precomputed.line_spacing
     block_name_x = precomputed.block_name_pos[0]
@@ -523,7 +523,6 @@ def generate_image_bytes(
     )
     draw.text((block_name_x, block_name_y), block_name, font=bottom_font, fill=blended)
 
-    # 动态调整进度条结束位置
     dynamic_progress_end_y = block_name_y - precomputed.line_spacing
     if dynamic_progress_end_y > precomputed.progress_start_y:
         progress_end_y = dynamic_progress_end_y
@@ -531,7 +530,6 @@ def generate_image_bytes(
         progress_end_y = precomputed.progress_start_y + 10
     progress_actual_height = progress_end_y - precomputed.progress_start_y
 
-    # ---------- 右下角 NamesList 信息 ----------
     info_start_x = precomputed.W - precomputed.info_max_width - precomputed.padding
     info_height = 0
 
@@ -587,7 +585,6 @@ def generate_image_bytes(
                     )
                     current_y = end_y + precomputed.info_line_height
 
-    # ---------- 左右竖进度条 ----------
     if show_block_progress_bar or show_global_progress_bar:
         block_progress_val = index_in_block / total_in_block if total_in_block > 0 else 0
         global_progress_val = (global_index + 1) / total_entries if total_entries > 0 else 0
@@ -642,7 +639,6 @@ def generate_image_bytes(
             if percent_x >= precomputed.padding:
                 draw.text((percent_x, percent_y), percent_text, font=bottom_font, fill=blended)
 
-    # ---------- 底部转圈动画 ----------
     if show_side_spinner and spinner_strings:
         spinner_y = top_font_y - precomputed.line_spacing * 2
         render_spinner_string_at_bottom(
@@ -656,7 +652,6 @@ def generate_image_bytes(
             color=blended
         )
 
-    # ---------- 保存图片 ----------
     buf = BytesIO()
     buf.truncate(50000)
     buf.seek(0)

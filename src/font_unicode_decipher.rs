@@ -25,11 +25,11 @@ struct Cli {
 enum Commands {
     Extract {
         #[arg(value_name = "FONT_FILES", required = true)]
-        font_files: Vec<PathBuf>,
+        font_files: Vec<String>,
 
         #[arg(short, long, value_name = "OUT_FILE")]
         out: Option<PathBuf>,
-        
+
         #[arg(long, value_name = "MODE", default_value = "any")]
         mode: String,
 
@@ -74,6 +74,7 @@ impl FontStyle {
     }
 }
 
+#[allow(dead_code)]
 struct FontInfo {
     path: PathBuf,
     face: Face<'static>,
@@ -118,8 +119,67 @@ impl FontInfo {
     }
 }
 
+fn collect_all_font_paths(specs: &[String]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for spec in specs {
+        if spec.starts_with('(') && spec.ends_with(')') {
+            let inner = &spec[1..spec.len()-1];
+            for name in inner.split(',').map(|s| s.trim()) {
+                if !name.is_empty() {
+                    paths.push(name.to_string());
+                }
+            }
+        } else {
+            paths.push(spec.clone());
+        }
+    }
+    paths
+}
+
+fn parse_slot_spec(spec: &str, loaded_fonts: &HashMap<String, FontInfo>) -> Vec<FontInfo> {
+    if spec.starts_with('(') && spec.ends_with(')') {
+        let inner = &spec[1..spec.len()-1];
+        let mut result = Vec::new();
+        for name in inner.split(',').map(|s| s.trim()) {
+            if let Some(font) = loaded_fonts.get(name) {
+                result.push(FontInfo {
+                    path: font.path.clone(),
+                    face: unsafe { std::mem::transmute_copy(&font.face) },
+                    data: font.data.clone(),
+                    supported: font.supported.clone(),
+                });
+            }
+        }
+        result
+    } else {
+        if let Some(font) = loaded_fonts.get(spec) {
+            vec![FontInfo {
+                path: font.path.clone(),
+                face: unsafe { std::mem::transmute_copy(&font.face) },
+                data: font.data.clone(),
+                supported: font.supported.clone(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn resolve_slot_font(slot_fonts: &[FontInfo], cp: u32) -> Option<String> {
+    for font in slot_fonts {
+        if font.supports(cp) {
+            return Some(font.name());
+        }
+    }
+    if let Some(first) = slot_fonts.first() {
+        Some(first.name())
+    } else {
+        None
+    }
+}
+
 pub fn extract_unicode_from_fonts(
-    font_paths: &[PathBuf],
+    font_specs: &[String],
     out_file: Option<&Path>,
     mode: ExtractMode,
     style: FontStyle,
@@ -128,39 +188,77 @@ pub fn extract_unicode_from_fonts(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| PathBuf::from("combined_unicode_list.txt"));
 
+    let all_paths = collect_all_font_paths(font_specs);
+
     println!("加载字体文件...");
-    let mut fonts = Vec::new();
-    for path in font_paths {
+    let mut loaded_fonts: HashMap<String, FontInfo> = HashMap::new();
+
+    for path_str in &all_paths {
+        let path = Path::new(path_str);
         match FontInfo::load(path) {
             Ok(info) => {
-                println!("  ✓ {} (支持 {} 个字符)", info.name(), info.supported.len());
-                fonts.push(info);
+                let name = info.name();
+                println!("  ✓ {} (支持 {} 个字符)", name, info.supported.len());
+                let name_clone = name.clone();
+                let path_clone = path_str.clone();
+                loaded_fonts.insert(name, info);
+                if let Some(font_ref) = loaded_fonts.get(&name_clone) {
+                    loaded_fonts.insert(path_clone, FontInfo {
+                        path: PathBuf::from(path_str),
+                        face: unsafe { std::mem::transmute_copy(&font_ref.face) },
+                        data: font_ref.data.clone(),
+                        supported: font_ref.supported.clone(),
+                    });
+                }
             }
             Err(e) => {
-                eprintln!("  ✗ 加载失败 {}: {}", path.display(), e);
+                eprintln!("  ✗ 加载失败 {}: {}", path_str, e);
             }
         }
     }
 
-    if fonts.is_empty() {
+    if loaded_fonts.is_empty() {
         bail!("没有成功加载任何字体");
     }
+
+    let slots: Vec<Vec<FontInfo>> = font_specs.iter()
+        .map(|spec| parse_slot_spec(spec, &loaded_fonts))
+        .collect();
 
     println!("\n收集字符码位 (模式: {}, 样式: {})...",
         if mode == ExtractMode::Any { "任一字体支持" } else { "全部字体支持" },
         if style == FontStyle::Compare { "对比" } else { "回退" }
     );
 
-    let mut codepoints: Vec<u32> = (0..=0x10FFFF)
-        .filter(|&cp| {
-            if mode == ExtractMode::Any {
-                fonts.iter().any(|f| f.supports(cp))
-            } else {
-                fonts.iter().all(|f| f.supports(cp))
-            }
-        })
-        .collect();
+    // ---- 优化开始：使用集合运算代替全范围遍历 ----
+    // 展平所有字体（按 slot 顺序）
+    let all_fonts: Vec<&FontInfo> = slots.iter().flat_map(|slot| slot.iter()).collect();
 
+    let codepoints_set = match mode {
+        ExtractMode::Any => {
+            // 求并集
+            let mut union = HashSet::new();
+            for font in &all_fonts {
+                union.extend(&font.supported);
+            }
+            union
+        }
+        ExtractMode::All => {
+            // 求交集
+            if all_fonts.is_empty() {
+                HashSet::new()
+            } else {
+                let mut intersection = all_fonts[0].supported.clone();
+                for font in &all_fonts[1..] {
+                    intersection.retain(|cp| font.supported.contains(cp));
+                }
+                intersection
+            }
+        }
+    };
+
+    // 排序
+    let mut codepoints: Vec<u32> = codepoints_set.into_iter().collect();
     codepoints.sort();
 
     println!("共收集 {} 个字符", codepoints.len());
@@ -172,23 +270,32 @@ pub fn extract_unicode_from_fonts(
 
     match style {
         FontStyle::Compare => {
-            // 对比模式：用 | 分隔所有字体，Python 端会并排显示
-            let font_names: Vec<String> = fonts.iter().map(|f| f.name()).collect();
-            let font_list_str = font_names.join("|");
-
+            // 对比模式：逐码位查询每个 slot 的命中字体（保持原有逻辑）
             for &cp in &codepoints {
-                writeln!(writer, "\"{}\";\"U+{:04X}\"", font_list_str, cp)?;
+                let resolved: Vec<String> = slots.iter()
+                    .map(|slot| resolve_slot_font(slot, cp).unwrap_or_else(|| "".to_string()))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !resolved.is_empty() {
+                    let font_list_str = resolved.join("|");
+                    writeln!(writer, "\"{}\";\"U+{:04X}\"", font_list_str, cp)?;
+                }
             }
         }
         FontStyle::Fallback => {
-            // 回退模式：为每个字符选择第一个支持它的字体
+            // 回退模式：预先构建码位→字体名称映射（按 slot 顺序）
+            let mut cp_to_font = HashMap::new();
+            for slot in &slots {
+                for font in slot {
+                    for &cp in &font.supported {
+                        cp_to_font.entry(cp).or_insert_with(|| font.name());
+                    }
+                }
+            }
             for &cp in &codepoints {
-                let selected_font = fonts.iter()
-                    .find(|f| f.supports(cp))
-                    .map(|f| f.name())
-                    .unwrap_or_else(|| fonts[0].name());
-
-                writeln!(writer, "\"{}\";\"U+{:04X}\"", selected_font, cp)?;
+                if let Some(name) = cp_to_font.get(&cp) {
+                    writeln!(writer, "\"{}\";\"U+{:04X}\"", name, cp)?;
+                }
             }
         }
     }

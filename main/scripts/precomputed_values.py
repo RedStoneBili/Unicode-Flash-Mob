@@ -72,6 +72,6 @@ class PrecomputedValues:
         self.spinner_start_x = (self.W - self.bottom_spinner_width) // 2
         self.spinner_end_x = self.spinner_start_x + self.bottom_spinner_width
 
-        self.multi_font_slot_width = int(500 * scale_factor)
-        self.multi_font_spacing = int(10 * scale_factor)
+        self.multi_font_slot_width = int(self.middle_font_size)
+        self.multi_font_spacing = int(15 * scale_factor)
         self.multi_font_total_width = self.multi_font_slot_width

@@ -48,12 +48,12 @@ class Config:
     output_dir: Path = Path.cwd() / 'png'
     font_files: list[Path] = None
     ctrl_font_file: Path = Path('Ctrl-Ctrl.ttf')
-    bottom_font_file: Path = Path.cwd() / 'PressStart2P-1.ttf'
+    bottom_font_file: Path = Path.cwd() / 'PressStartHan2P.ttf'
     music_file: Path = Path.cwd() / 'DUTM.m4a'
     middle_font_size: int = 512
-    bottom_font_size: int = 19
+    bottom_font_size: int = 16
     text_position: tuple[int, int] = (0, 0)  # (text_position_x, text_position_y)
-    middle_font_color: tuple[int, int, int, int] = (20, 20, 20, 200)
+    middle_font_color: tuple[int, int, int, int] = (20, 20, 20, 175)
     image_size: tuple[int, int] = (1920, 1080)
     background_color: tuple[int, int, int, int] = (0, 0, 0, 255)
     color_cycle: list[tuple[int, int, int, int]] = None
@@ -71,7 +71,8 @@ class Config:
                 "#00BE9DFF", "#00CB81FF", "#A8FD9AFF",
                 "#99FEA9FF", "#98FCCAFF", "#98FEEBFF",
                 "#97ECFDFF", "#33E2FDFF", "#34B5DFFF",
-                "#0095E0FF", "#CD9BFFFF", "#AB9BFFFF",
+                "#0095E0FF", "#CD9BFFFF", "#A"
+                                          "B9BFFFF",
                 "#EE9AFFEF", "#FF9AF0FF", "#FE9ACCFF",
                 "#FF9AAAFF", "#FCAB9AFF", "#FBC99AFF",
                 "#FDEE99FF", "#EEFE99FF", "#CFFF9BFF",
