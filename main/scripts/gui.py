@@ -33,6 +33,10 @@ class UnicodeFlashMobGUI:
         self.range_font_var = tk.StringVar(value='font.ttf')
         self.range_out_var = tk.StringVar(value='combined_unicode_list.txt')
 
+        self.text_file_var = tk.StringVar(value='text.txt')
+        self.text_font_var = tk.StringVar(value='text')
+        self.text_out_var = tk.StringVar(value='combined_unicode_list.txt')
+
         self.replace_mode = tk.StringVar(value='3')
 
         self.bg_mode = tk.StringVar(value='dynamic')
@@ -166,6 +170,8 @@ class UnicodeFlashMobGUI:
                        command=lambda: (self.toggle_range_extract(), self.update_command())).pack(side=tk.LEFT, padx=5)
         tk.Radiobutton(radio_frame, text="从Unicode范围生成", variable=self.list_gen_mode, value='range',
                        command=lambda: (self.toggle_range_extract(), self.update_command())).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(radio_frame, text="从文本文件生成", variable=self.list_gen_mode, value='text',
+                       command=lambda: (self.toggle_range_extract(), self.update_command())).pack(side=tk.LEFT, padx=5)
 
         self.extract_frame = tk.LabelFrame(frame, text="字体提取设置")
         self.extract_frame.pack(fill=tk.X, padx=20, pady=5)
@@ -204,6 +210,12 @@ class UnicodeFlashMobGUI:
         self.add_label_entry(self.range_frame, "字体路径", self.range_font_var)
         self.add_label_entry(self.range_frame, "输出文件名", self.range_out_var)
 
+        self.text_frame = tk.LabelFrame(frame, text="文本文件生成设置")
+        self.text_frame.pack(fill=tk.X, padx=20, pady=5)
+        self.add_label_entry(self.text_frame, "文本文件路径", self.text_file_var)
+        self.add_label_entry(self.text_frame, "字体名称 (用于列表)", self.text_font_var)
+        self.add_label_entry(self.text_frame, "输出文件名", self.text_out_var)
+
         self.toggle_range_extract()
 
     def toggle_mode_for_style(self):
@@ -217,12 +229,19 @@ class UnicodeFlashMobGUI:
             self.extract_slots_label.config(text="字体槽位（每行一个，格式: font.ttf 或 (font1,font2)）")
 
     def toggle_range_extract(self):
-        if self.list_gen_mode.get() == 'extract':
+        mode = self.list_gen_mode.get()
+        if mode == 'extract':
             self.extract_frame.pack(fill=tk.X, padx=20, pady=5)
             self.range_frame.pack_forget()
-        else:
+            self.text_frame.pack_forget()
+        elif mode == 'range':
             self.range_frame.pack(fill=tk.X, padx=20, pady=5)
             self.extract_frame.pack_forget()
+            self.text_frame.pack_forget()
+        else:
+            self.text_frame.pack(fill=tk.X, padx=20, pady=5)
+            self.extract_frame.pack_forget()
+            self.range_frame.pack_forget()
 
     def build_step4(self):
         frame = ttk.Frame(self.notebook)
@@ -327,7 +346,7 @@ class UnicodeFlashMobGUI:
         self.add_step_check(frame, 8, "清理临时文件", var=self.cleanup_var)
         tk.Label(frame, text="命令: Start-Process .\\output", fg="green", font=("Consolas", 9))\
             .pack(anchor=tk.W, padx=20, pady=2)
-        tk.Label(frame, text='命令: Remove-Item "Unicode.txt","color_state.json" -Force -ErrorAction SilentlyContinue',
+        tk.Label(frame, text='命令: Remove-Item "Unicode.txt","color_state.json","_flash_order.txt" -Force -ErrorAction SilentlyContinue',
                  fg="green", font=("Consolas", 9)).pack(anchor=tk.W, padx=20, pady=2)
 
     def update_command(self):
@@ -381,12 +400,17 @@ class UnicodeFlashMobGUI:
                 if style_val != 'fallback':
                     cmd += f' --mode {mode_val}'
                 return [cmd]
-            else:
+            elif mode == 'range':
                 start = self.range_start_var.get().strip() or "0000"
                 end = self.range_end_var.get().strip() or "10FFFF"
                 font = self.range_font_var.get().strip() or "font.ttf"
                 out = self.range_out_var.get().strip() or "combined_unicode_list.txt"
                 return [f'./unicode_flash_mob.exe generate-unicode-range --file "{out}" --start {start} --end {end} --font "{font}"']
+            else:
+                txt = self.text_file_var.get().strip()
+                out = self.text_out_var.get().strip() or "combined_unicode_list.txt"
+                font = self.text_font_var.get().strip() or "text"
+                return [f'./unicode_flash_mob.exe generate-from-text "{txt}" --out "{out}" --font-name "{font}"']
 
         if step == 4:
             return ['Rename-Item "combined_unicode_list.txt" "Unicode.txt" -ErrorAction Stop']
@@ -460,7 +484,7 @@ class UnicodeFlashMobGUI:
             if self.open_output_var.get():
                 cmds.append('Start-Process .\\output')
             if self.cleanup_var.get():
-                cmds.append('Remove-Item "Unicode.txt","color_state.json" -Force -ErrorAction SilentlyContinue')
+                cmds.append('Remove-Item "Unicode.txt","color_state.json","_flash_order.txt" -Force -ErrorAction SilentlyContinue')
             return cmds
 
         return []

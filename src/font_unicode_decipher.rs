@@ -9,6 +9,7 @@ use std::{
     path::{PathBuf, Path},
 };
 use ttf_parser::Face;
+use std::collections::BTreeSet;
 
 const BLOCKS_FILE: &str = "DecipherUnicodeBlocks.txt";
 const DATA_FILE: &str = "DecipherUnicodeData.txt";
@@ -353,6 +354,28 @@ pub fn replace_unicode(mode: Option<u8>) -> Result<()> {
         .with_context(|| format!("写入文件 `{}` 失败", TEMP_FILE))?;
 
     println!("替换完成，结果已写入 `{}`", TEMP_FILE);
+    Ok(())
+}
+
+pub fn generate_from_text(text_path: &Path, out_path: &Path, font_name: &str) -> Result<()> {
+    let content = fs::read_to_string(text_path)
+        .with_context(|| format!("无法读取文本文件: {:?}", text_path))?;
+    let mut set = BTreeSet::new();
+    for ch in content.chars() {
+        set.insert(ch);
+    }
+    let file = fs::File::create(out_path)
+        .with_context(|| format!("无法创建输出文件: {:?}", out_path))?;
+    let mut writer = BufWriter::new(file);
+    for ch in set {
+        let cp = ch as u32;
+        writeln!(writer, "\"{}\";\"U+{:04X}\";\"\"", font_name, cp)
+            .context("写入行失败")?;
+    }
+    writer.flush().context("刷新缓冲区失败")?;
+    let flash_file = Path::new("_flash_order.txt");
+    fs::copy(text_path, flash_file)
+        .with_context(|| format!("无法复制文本文件到 {:?}", flash_file))?;
     Ok(())
 }
 

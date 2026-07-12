@@ -223,42 +223,84 @@ def main():
 
     logging.info(f"找到 {len(image_files)} 个PNG文件")
 
-    # 解析文件名获取Unicode值
-    valid_files = []
-    entries = []
-
-    for file_name in image_files:
+    flash_order_file = Path.cwd() / "_flash_order.txt"
+    ordered_characters = None
+    if flash_order_file.exists():
         try:
-            clean_name = file_name.lstrip('\ufeff')
-            match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', clean_name)
-            if match:
-                unicode_value = int(match.group(1), 16)
-                valid_files.append((unicode_value, file_name))
+            with open(flash_order_file, 'r', encoding='utf-8-sig') as f:
+                text = f.read()
+            ordered_characters = [ch for ch in text if not ch.isspace()]
+            logging.info(f"检测到顺序文件，共 {len(ordered_characters)} 个字符")
+        except Exception as e:
+            logging.error(f"读取顺序文件失败: {e}")
+            ordered_characters = None
 
-                from Module import UnicodeEntry
-                code_str = f"U+{match.group(1).upper()}"
+    png_map = {}
+    for file_name in image_files:
+        match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', file_name)
+        if match:
+            code_str = f"U+{match.group(1).upper()}"
+            png_map[code_str] = file_name
+
+    if ordered_characters is not None:
+        sorted_image_files = []
+        for ch in ordered_characters:
+            cp = ord(ch)
+            code_str = f"U+{cp:04X}"
+            if code_str in png_map:
+                sorted_image_files.append(png_map[code_str])
+            else:
+                logging.warning(f"未找到字符 {ch} (U+{cp:04X}) 对应的PNG，已跳过")
+        logging.info(f"按顺序文件提取到 {len(sorted_image_files)} 张图片")
+        from Module import UnicodeEntry
+        entries = []
+        for ch in ordered_characters:
+            cp = ord(ch)
+            code_str = f"U+{cp:04X}"
+            if code_str in png_map:
                 entries.append(UnicodeEntry(
                     font_path=Path(""),
                     code_str=code_str,
                     description=""
                 ))
-            else:
-                logging.warning(f"警告：文件名格式不符合要求，跳过：{file_name}")
-        except ValueError as e:
-            logging.error(f"处理文件 {file_name} 时出错：{e}")
+        logging.info(f"为章节生成构建 {len(entries)} 个条目")
+    else:
+        # 解析文件名获取Unicode值
+        valid_files = []
+        entries = []
 
-    if not valid_files:
-        logging.warning("没有找到符合命名规则的PNG文件")
-        sys.exit(1)
+        for file_name in image_files:
+            try:
+                clean_name = file_name.lstrip('\ufeff')
+                match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', clean_name)
+                if match:
+                    unicode_value = int(match.group(1), 16)
+                    valid_files.append((unicode_value, file_name))
 
-    # 按Unicode值排序
-    valid_files.sort(key=lambda x: x[0])
-    sorted_image_files = [f[1] for f in valid_files]
+                    from Module import UnicodeEntry
+                    code_str = f"U+{match.group(1).upper()}"
+                    entries.append(UnicodeEntry(
+                        font_path=Path(""),
+                        code_str=code_str,
+                        description=""
+                    ))
+                else:
+                    logging.warning(f"警告：文件名格式不符合要求，跳过：{file_name}")
+            except ValueError as e:
+                logging.error(f"处理文件 {file_name} 时出错：{e}")
 
-    # 同时确保entries也是按相同顺序排序
-    entries.sort(key=lambda x: int(x.code_str[2:], 16))
+        if not valid_files:
+            logging.warning("没有找到符合命名规则的PNG文件")
+            sys.exit(1)
 
-    logging.info(f"有效文件：{len(sorted_image_files)} 个")
+        # 按Unicode值排序
+        valid_files.sort(key=lambda x: x[0])
+        sorted_image_files = [f[1] for f in valid_files]
+
+        # 同时确保entries也是按相同顺序排序
+        entries.sort(key=lambda x: int(x.code_str[2:], 16))
+
+        logging.info(f"有效文件：{len(sorted_image_files)} 个")
 
     # 生成视频
     output_file = os.path.join(output_dir, output_file_name + '.mp4')

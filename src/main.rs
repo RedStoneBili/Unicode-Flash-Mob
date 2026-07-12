@@ -47,6 +47,14 @@ enum Commands {
         #[arg(value_name = "MODE")]
         mode: Option<u8>,
     },
+    GenerateFromText {
+        #[arg(value_name = "TEXT_FILE")]
+        text_file: PathBuf,
+        #[arg(short, long, value_name = "OUT_FILE", default_value = "combined_unicode_list.txt")]
+        out: PathBuf,
+        #[arg(short, long, value_name = "FONT_NAME", default_value = "text")]
+        font_name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -71,6 +79,9 @@ fn main() -> Result<()> {
         }
         Commands::ReplaceUnicodeData { mode } => {
             font_unicode_decipher::replace_unicode(mode)?
+        }
+        Commands::GenerateFromText { text_file, out, font_name } => {
+            font_unicode_decipher::generate_from_text(&text_file, &out, &font_name)?
         }
     }
     Ok(())
