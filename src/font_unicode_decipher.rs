@@ -2,14 +2,13 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use regex::Regex;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, BTreeSet},
     fs,
     fs::File,
     io::{self, BufRead, BufReader, BufWriter, Write},
     path::{PathBuf, Path},
 };
 use ttf_parser::Face;
-use std::collections::BTreeSet;
 
 const BLOCKS_FILE: &str = "DecipherUnicodeBlocks.txt";
 const DATA_FILE: &str = "DecipherUnicodeData.txt";
@@ -41,12 +40,21 @@ enum Commands {
         #[arg(value_name = "MODE")]
         mode: Option<u8>,
     },
+    GenerateFromText {
+        #[arg(value_name = "TEXT_FILE")]
+        text_file: PathBuf,
+        #[arg(short, long, value_name = "OUT_FILE", default_value = "combined_unicode_list.txt")]
+        out: PathBuf,
+        #[arg(short, long, value_name = "FONT_NAME", default_value = "text")]
+        font_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExtractMode {
     Any,
     All,
+    FilteredAny,
 }
 
 impl ExtractMode {
@@ -54,7 +62,8 @@ impl ExtractMode {
         match s.to_lowercase().as_str() {
             "any" => Ok(ExtractMode::Any),
             "all" => Ok(ExtractMode::All),
-            _ => bail!("无效模式：{}，仅支持 any 或 all", s),
+            "any-filtered" | "delno" => Ok(ExtractMode::FilteredAny),
+            _ => bail!("无效模式：{}，仅支持 any、all、any-filtered(delno)", s),
         }
     }
 }
@@ -63,6 +72,7 @@ impl ExtractMode {
 pub enum FontStyle {
     Fallback,
     Compare,
+    Obo, // 新增：依次闪出
 }
 
 impl FontStyle {
@@ -70,7 +80,8 @@ impl FontStyle {
         match s.to_lowercase().as_str() {
             "fallback" => Ok(FontStyle::Fallback),
             "compare" => Ok(FontStyle::Compare),
-            _ => bail!("无效样式：{}，仅支持 fallback 或 compare", s),
+            "obo" | "oyo" => Ok(FontStyle::Obo),
+            _ => bail!("无效样式：{}，仅支持 fallback、compare、obo(oyo)", s),
         }
     }
 }
@@ -166,19 +177,6 @@ fn parse_slot_spec(spec: &str, loaded_fonts: &HashMap<String, FontInfo>) -> Vec<
     }
 }
 
-fn resolve_slot_font(slot_fonts: &[FontInfo], cp: u32) -> Option<String> {
-    for font in slot_fonts {
-        if font.supports(cp) {
-            return Some(font.name());
-        }
-    }
-    if let Some(first) = slot_fonts.first() {
-        Some(first.name())
-    } else {
-        None
-    }
-}
-
 pub fn extract_unicode_from_fonts(
     font_specs: &[String],
     out_file: Option<&Path>,
@@ -226,18 +224,23 @@ pub fn extract_unicode_from_fonts(
         .map(|spec| parse_slot_spec(spec, &loaded_fonts))
         .collect();
 
-    println!("\n收集字符码位 (模式: {}, 样式: {})...",
-        if mode == ExtractMode::Any { "任一字体支持" } else { "全部字体支持" },
-        if style == FontStyle::Compare { "对比" } else { "回退" }
-    );
+    let style_label = match style {
+        FontStyle::Fallback => "回退",
+        FontStyle::Compare => "对比",
+        FontStyle::Obo => "依次闪出",
+    };
+    let mode_label = match mode {
+        ExtractMode::Any => "任一字体支持",
+        ExtractMode::All => "全部字体支持",
+        ExtractMode::FilteredAny => "任一字体支持（过滤不支持）",
+    };
+    println!("\n收集字符码位 (模式: {}, 样式: {})...", mode_label, style_label);
 
-    // ---- 优化开始：使用集合运算代替全范围遍历 ----
     // 展平所有字体（按 slot 顺序）
     let all_fonts: Vec<&FontInfo> = slots.iter().flat_map(|slot| slot.iter()).collect();
 
     let codepoints_set = match mode {
-        ExtractMode::Any => {
-            // 求并集
+        ExtractMode::Any | ExtractMode::FilteredAny => {
             let mut union = HashSet::new();
             for font in &all_fonts {
                 union.extend(&font.supported);
@@ -269,16 +272,32 @@ pub fn extract_unicode_from_fonts(
         .with_context(|| format!("无法创建输出文件：{:?}", out_path))?;
     let mut writer = BufWriter::new(file);
 
+    let separator = match style {
+        FontStyle::Compare => "|",
+        FontStyle::Obo => ":",
+        FontStyle::Fallback => "|",
+    };
+
     match style {
-        FontStyle::Compare => {
-            // 对比模式：逐码位查询每个 slot 的命中字体（保持原有逻辑）
+        FontStyle::Compare | FontStyle::Obo => {
             for &cp in &codepoints {
                 let resolved: Vec<String> = slots.iter()
-                    .map(|slot| resolve_slot_font(slot, cp).unwrap_or_else(|| "".to_string()))
-                    .filter(|s| !s.is_empty())
+                    .filter_map(|slot| {
+                        let has_support = slot.iter().any(|font| font.supports(cp));
+                        if has_support {
+                            slot.iter().find(|font| font.supports(cp)).map(|font| font.name())
+                        } else {
+                            match mode {
+                                ExtractMode::Any | ExtractMode::All => {
+                                    slot.first().map(|font| font.name())
+                                }
+                                ExtractMode::FilteredAny => None,
+                            }
+                        }
+                    })
                     .collect();
                 if !resolved.is_empty() {
-                    let font_list_str = resolved.join("|");
+                    let font_list_str = resolved.join(separator);
                     writeln!(writer, "\"{}\";\"U+{:04X}\"", font_list_str, cp)?;
                 }
             }

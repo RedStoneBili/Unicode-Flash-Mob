@@ -1289,10 +1289,12 @@ name = "unicode_flash_mob"
 version = "2.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "embed-resource",
  "regex",
  "reqwest",
+ "slab",
  "ttf-parser",
 ]
 

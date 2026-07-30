@@ -1,5 +1,3 @@
-# generate_png.py (修改后的完整文件)
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -85,6 +83,11 @@ def generate_image_bytes(
         total_in_block: int = 0,
         index_in_block: int = 0,
         scale_factor: float = 1.0,
+        style: str = 'compare',
+        font_paths: List[str] = None,
+        font_index: int = 0,
+        total_fonts: int = 1,
+        font_name: str = '',
 ) -> tuple[bytes, Path, str | None]:
     try:
         cp = int(entry.code_str.strip()[2:], 16)
@@ -94,9 +97,9 @@ def generate_image_bytes(
     char = get_char(cp)
     is_control = (cp in CTRLS)
 
-    font_paths = entry.get_font_paths()
-    is_multi_font = entry.has_multiple_fonts()
-    is_compare_mode = entry.is_compare_mode() if hasattr(entry, 'is_compare_mode') else ('|' in entry.font_path)
+    if font_paths is None:
+        font_paths = [entry.font_path]
+    is_multi_font = (len(font_paths) > 1) and (style == 'compare')
 
     if flash_color:
         bg_color = flash_color
@@ -124,7 +127,7 @@ def generate_image_bytes(
         if not random_color and not gradient_manager and not flash_color:
             blend_cache[bg_key] = blended
 
-    if is_multi_font and is_compare_mode:
+    if is_multi_font:
         num_fonts = len(font_paths)
         precomputed.multi_font_total_width = num_fonts * precomputed.multi_font_slot_width + (num_fonts - 1) * precomputed.multi_font_spacing
         total_width = precomputed.multi_font_total_width
@@ -266,34 +269,34 @@ def generate_image_bytes(
 
         main_char_right_edge = start_x + total_width
     else:
-        if is_control:
-            middle_font = ctrl_font
-            font_path_key = 'ctrl'
-        else:
-            font_path_str = font_paths[0] if font_paths else str(cfg.font_files[0])
-            font_path = Path(font_path_str)
-            middle_font = middle_font_cache.get(font_path)
-            font_path_key = font_path
-            if not middle_font:
-                try:
-                    middle_font = ImageFont.truetype(str(font_path), cfg.middle_font_size)
-                    middle_font_cache[font_path] = middle_font
-                    metrics_cache[font_path] = middle_font.getmetrics()
-                except Exception as e:
-                    logging.debug(f"直接加载字体失败 {font_path}: {e}")
-                    middle_font = None
-            if not middle_font:
-                for p in cfg.font_files:
-                    f = middle_font_cache.get(p)
-                    if f:
-                        middle_font = f
-                        font_path_key = p
-                        break
+        font_path_str = font_paths[0] if font_paths else str(cfg.font_files[0])
+        font_path = Path(font_path_str)
+        middle_font = middle_font_cache.get(font_path)
+        font_path_key = font_path
+        if not middle_font:
+            try:
+                middle_font = ImageFont.truetype(str(font_path), cfg.middle_font_size)
+                middle_font_cache[font_path] = middle_font
+                metrics_cache[font_path] = middle_font.getmetrics()
+            except Exception as e:
+                logging.debug(f"直接加载字体失败 {font_path}: {e}")
+                middle_font = None
+        if not middle_font:
+            for p in cfg.font_files:
+                f = middle_font_cache.get(p)
+                if f:
+                    middle_font = f
+                    font_path_key = p
+                    break
 
         if not middle_font:
             char = "无法加载字体：" + char
             middle_font = ImageFont.load_default()
             font_path_key = 'default'
+
+        if is_control:
+            middle_font = ctrl_font
+            font_path_key = 'ctrl'
 
         if font_path_key in metrics_cache:
             ascent, descent = metrics_cache[font_path_key]
@@ -470,14 +473,13 @@ def generate_image_bytes(
             draw.text((encoding_x, encoding_y + precomputed.encoding_line_height), utf16le_text, font=bottom_font, fill=blended)
             draw.text((encoding_x, encoding_y + precomputed.encoding_line_height * 2), utf16be_text, font=bottom_font, fill=blended)
 
-    if is_multi_font and is_compare_mode:
+    if is_multi_font:
         font_display_names = [Path(p).name for p in font_paths]
         font_line_count = len(font_display_names)
     else:
         if is_control:
             font_path_key = 'ctrl'
         else:
-            font_path_str = font_paths[0] if font_paths else str(cfg.font_files[0])
             font_path_key = Path(font_path_str)
         font_display_names = [get_font_display_name(font_path_key, cfg)]
         font_line_count = 1
@@ -666,11 +668,16 @@ def generate_image_bytes(
     buf.close()
 
     if filename_mapping and entry.code_str in filename_mapping:
-        output_filename = filename_mapping[entry.code_str]
+        base_filename = filename_mapping[entry.code_str]
     else:
-        output_filename = entry.code_str
+        base_filename = entry.code_str
 
-    out_path = cfg.output_dir / f"image_{output_filename}.png"
+    if style == 'obo' and font_name:
+        output_filename = f"image_{base_filename}-{font_name}"
+    else:
+        output_filename = f"image_{base_filename}"
+
+    out_path = cfg.output_dir / f"{output_filename}.png"
     return data, out_path, None
 
 
@@ -859,7 +866,7 @@ def main():
     else:
         cfg.png_compress_level, cfg.png_optimize = 6, True
 
-    existing_files = {p.stem.split('_')[-1] for p in cfg.output_dir.glob('*.png') if p.stat().st_size >= 1000}
+    existing_files = {p.stem for p in cfg.output_dir.glob('*.png') if p.stat().st_size >= 1000}
 
     entries = load_unicode_entries(cfg.unicode_file)
     total_entries = len(entries)
@@ -869,18 +876,35 @@ def main():
         logging.info("应用文件名随机化：内容按原顺序生成，但文件名随机分配")
         filename_mapping = create_filename_mapping(entries)
 
-    if args.force:
-        to_process = entries
-    else:
-        to_process = []
-        for e in entries:
-            if filename_mapping and e.code_str in filename_mapping:
-                mapped_name = filename_mapping[e.code_str]
-                if mapped_name not in existing_files:
-                    to_process.append(e)
-            else:
-                if e.code_str not in existing_files:
-                    to_process.append(e)
+    # 解析每个条目的字体列表，并判断模式
+    to_process = []
+    for e in entries:
+        if ':' in e.font_path:
+            all_font_paths = e.font_path.split(':')
+            style = 'obo'
+        elif '|' in e.font_path:
+            all_font_paths = e.font_path.split('|')
+            style = 'compare'
+        else:
+            all_font_paths = [e.font_path]
+            style = 'single'
+
+        all_exist = True
+        if style == 'obo':
+            base = filename_mapping.get(e.code_str, e.code_str) if filename_mapping else e.code_str
+            for font_file in [Path(p).name for p in all_font_paths]:
+                fname = f"image_{base}-{font_file}"
+                if fname not in existing_files:
+                    all_exist = False
+                    break
+        else:
+            base = filename_mapping.get(e.code_str, e.code_str) if filename_mapping else e.code_str
+            fname = f"image_{base}"
+            if fname not in existing_files:
+                all_exist = False
+
+        if args.force or not all_exist:
+            to_process.append((e, all_font_paths, style))
 
     if not to_process:
         logging.info("所有图片已存在，无需生成")
@@ -953,10 +977,17 @@ def main():
         if animated_elements:
             logging.info(f"启用元素动画: {', '.join(animated_elements)}")
 
+    total_images_needed = 0
+    for _, all_font_paths, style in to_process:
+        if style == 'obo':
+            total_images_needed += len(all_font_paths)
+        else:
+            total_images_needed += 1
+
     position_animator = None
     if animated_elements:
         position_animator = PositionAnimator(
-            total_images=len(to_process),
+            total_images=total_images_needed,
             animation_type=args.animation_type,
             amplitude=int(args.animation_amplitude * scale_factor),
             speed=args.animation_speed,
@@ -1015,20 +1046,7 @@ def main():
             logging.info(f"固定背景: {cfg.background_color}")
         blend_cache, overlay_cache = precompute_blend_colors(cfg, [cfg.background_color])
 
-    logging.info(f"需要生成 {len(to_process)} 张图片 (workers={args.workers}, png-quality={args.png_quality}, scale={scale_factor:.2f}, 最终分辨率: {cfg.image_size[0]}x{cfg.image_size[1]})")
-
-    if args.show_encoding:
-        logging.info("启用编码信息显示（UTF-8、UTF-16LE、UTF-16BE）")
-    if args.show_block_position:
-        logging.info("启用区块位置显示 [n/m]")
-    if args.show_global_position:
-        logging.info("启用全局位置显示 [n/m]")
-    if args.show_block_progress_bar:
-        logging.info("启用区块进度条显示")
-    if args.show_global_progress_bar:
-        logging.info("启用全局进度条显示")
-    if args.show_side_spinner:
-        logging.info(f"启用转圈圈动画，字符串列表: {spinner_strings}，切换间隔: {args.spinner_step_interval}张")
+    logging.info(f"需要生成 {total_images_needed} 张图片 (workers={args.workers}, png-quality={args.png_quality}, scale={scale_factor:.2f})")
 
     bottom_font = ImageFont.truetype(str(cfg.bottom_font_file), cfg.bottom_font_size)
     try:
@@ -1037,7 +1055,13 @@ def main():
         logging.error(f"加载 Ctrl 字体失败: {cfg.ctrl_font_file}")
         ctrl_font = ImageFont.load_default()
 
-    middle_font_cache, metrics_cache = preload_middle_fonts(to_process, cfg)
+    # 收集所有用到的字体路径用于预加载
+    all_font_paths_set = set()
+    for _, font_paths, _ in to_process:
+        all_font_paths_set.update(font_paths)
+    middle_font_cache, metrics_cache = preload_middle_fonts(
+        [UnicodeEntry(p, "", "") for p in all_font_paths_set], cfg
+    )
 
     text_cache: dict[str, tuple[int, int]] = {}
     overlay_bbox_cache: dict[str, tuple[int, int]] = {}
@@ -1049,81 +1073,135 @@ def main():
     start = time.time()
     match_results = []
 
-    sorted_entries = sorted(to_process, key=lambda x: int(x.code_str[2:], 16))
+    sorted_to_process = sorted(to_process, key=lambda x: int(x[0].code_str[2:], 16))
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool, \
-            tqdm(total=len(sorted_entries), desc="生成图片", unit="项") as bar:
-        for i, entry in enumerate(sorted_entries):
-            bar.set_description(f"生成图片: {entry.code_str}")
+            tqdm(total=total_images_needed, desc="生成图片", unit="项") as bar:
 
-            if filename_mapping:
-                original_order = [e.code_str for e in entries].index(entry.code_str)
-                gradient_index = original_order
+        global_image_index = 0
+
+        for entry, all_font_paths, style in sorted_to_process:
+            index_in_block, total_in_block = block_index_mapping.get(entry.code_str, (0, 0))
+
+            if style == 'obo':
+                total_fonts = len(all_font_paths)
+                for idx, font_path_str in enumerate(all_font_paths):
+                    font_file = Path(font_path_str).name
+                    bar.set_description(f"生成图片: {entry.code_str} ({font_file})")
+
+                    future = pool.submit(
+                        generate_image_bytes,
+                        entry, cfg, color_mgr,
+                        bottom_font, ctrl_font,
+                        middle_font_cache, metrics_cache,
+                        text_cache,
+                        precomputed,
+                        blend_cache, overlay_cache,
+                        overlay_enabled, combining_cps,
+                        overlay_bbox_cache, blocks,
+                        unicode_names,
+                        names_list_parser,
+                        args.random_color and not gradient_manager and not flash_color,
+                        filename_mapping,
+                        gradient_manager,
+                        global_image_index,
+                        total_images_needed,
+                        flash_color,
+                        position_animator,
+                        animated_elements,
+                        content_position_random,
+                        content_position_fixed,
+                        args.show_names_info,
+                        args.smooth_gradient,
+                        args.show_encoding,
+                        args.show_block_position,
+                        args.show_global_position,
+                        args.show_block_progress_bar,
+                        args.show_global_progress_bar,
+                        args.show_side_spinner,
+                        (global_image_index // args.spinner_step_interval) % len(spinner_strings),
+                        spinner_strings,
+                        global_image_index,
+                        total_images_needed,
+                        total_in_block,
+                        index_in_block,
+                        scale_factor,
+                        'obo',
+                        [font_path_str],
+                        0,
+                        total_fonts,
+                        font_file,
+                    )
+                    try:
+                        data, path, matched_key = future.result()
+                        q.put((data, path))
+                        match_results.append((entry.code_str, matched_key))
+                    except Exception as e:
+                        logging.error(f"生成失败: {e}")
+                    finally:
+                        bar.update(1)
+                        global_image_index += 1
             else:
-                gradient_index = i
-
-            color_index = gradient_index * args.animation_speed
-
-            index_in_block = 0
-            total_in_block = 0
-            if block_index_mapping and entry.code_str in block_index_mapping:
-                index_in_block, total_in_block = block_index_mapping[entry.code_str]
-
-            spinner_step = (i // args.spinner_step_interval) % len(spinner_strings)
-
-            future = pool.submit(
-                generate_image_bytes,
-                entry, cfg, color_mgr,
-                bottom_font, ctrl_font,
-                middle_font_cache, metrics_cache,
-                text_cache,
-                precomputed,
-                blend_cache, overlay_cache,
-                overlay_enabled, combining_cps,
-                overlay_bbox_cache, blocks,
-                unicode_names,
-                names_list_parser,
-                args.random_color and not gradient_manager and not flash_color,
-                filename_mapping,
-                gradient_manager,
-                color_index,
-                len(sorted_entries),
-                flash_color,
-                position_animator,
-                animated_elements,
-                content_position_random,
-                content_position_fixed,
-                args.show_names_info,
-                args.smooth_gradient,
-                args.show_encoding,
-                args.show_block_position,
-                args.show_global_position,
-                args.show_block_progress_bar,
-                args.show_global_progress_bar,
-                args.show_side_spinner,
-                spinner_step,
-                spinner_strings,
-                i,
-                total_entries,
-                total_in_block,
-                index_in_block,
-                scale_factor,
-            )
-            try:
-                data, path, matched_key = future.result()
-                q.put((data, path))
-                match_results.append((entry.code_str, matched_key))
-            except Exception as e:
-                logging.error(f"生成失败: {e}")
-            finally:
-                bar.update(1)
+                bar.set_description(f"生成图片: {entry.code_str}")
+                future = pool.submit(
+                    generate_image_bytes,
+                    entry, cfg, color_mgr,
+                    bottom_font, ctrl_font,
+                    middle_font_cache, metrics_cache,
+                    text_cache,
+                    precomputed,
+                    blend_cache, overlay_cache,
+                    overlay_enabled, combining_cps,
+                    overlay_bbox_cache, blocks,
+                    unicode_names,
+                    names_list_parser,
+                    args.random_color and not gradient_manager and not flash_color,
+                    filename_mapping,
+                    gradient_manager,
+                    global_image_index,
+                    total_images_needed,
+                    flash_color,
+                    position_animator,
+                    animated_elements,
+                    content_position_random,
+                    content_position_fixed,
+                    args.show_names_info,
+                    args.smooth_gradient,
+                    args.show_encoding,
+                    args.show_block_position,
+                    args.show_global_position,
+                    args.show_block_progress_bar,
+                    args.show_global_progress_bar,
+                    args.show_side_spinner,
+                    (global_image_index // args.spinner_step_interval) % len(spinner_strings),
+                    spinner_strings,
+                    global_image_index,
+                    total_images_needed,
+                    total_in_block,
+                    index_in_block,
+                    scale_factor,
+                    'compare',
+                    all_font_paths,
+                    0,
+                    1,
+                    '',
+                )
+                try:
+                    data, path, matched_key = future.result()
+                    q.put((data, path))
+                    match_results.append((entry.code_str, matched_key))
+                except Exception as e:
+                    logging.error(f"生成失败: {e}")
+                finally:
+                    bar.update(1)
+                    global_image_index += 1
 
     q.join()
     q.put(None)
     writer.join()
 
     elapsed = time.time() - start
-    fps = len(to_process) / elapsed if elapsed > 0 else float('inf')
+    fps = total_images_needed / elapsed if elapsed > 0 else float('inf')
     logging.info(f"完成，用时 {elapsed:.2f}s，{fps:.2f} 张/秒。")
 
     if args.shuffle_content and filename_mapping:

@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from Module import Config, setup_logging, load_unicode_entries, load_unicode_blocks, ChapterGenerator
+from Module import Config, setup_logging, load_unicode_entries, load_unicode_blocks, ChapterGenerator, UnicodeEntry
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 os.chdir(base_dir)
@@ -65,7 +65,6 @@ def convert_images_to_video(image_folder, output_file, frame_rate, file_list):
             '-avoid_negative_ts', 'make_zero', '-threads', str(os.cpu_count() or 4), output_file
         ]
 
-
         logging.info(f"开始转换视频，共 {len(file_list)} 张图片...")
         process = subprocess.Popen(ffmpeg_command)
         process.wait()
@@ -115,10 +114,8 @@ def generate_chapter_file(entries, blocks, frame_rate, output_dir, video_name):
         logging.warning("没有区块信息或条目信息，无法生成章节文件")
         return False
 
-    # 创建章节生成器（不强制最小间隔，使用真实时间）
     chapter_gen = ChapterGenerator(min_seconds=0)
 
-    # 按区块生成章节 - 使用每个区块第一个字符的真实时间
     chapters = chapter_gen.generate_chapters_by_blocks(
         blocks=blocks,
         entries=entries,
@@ -127,11 +124,9 @@ def generate_chapter_file(entries, blocks, frame_rate, output_dir, video_name):
     )
 
     if chapters:
-        # 打印章节信息
         logging.info("生成的章节列表（起始时间）：")
         for i, (time_point, name) in enumerate(chapters):
             time_str = chapter_gen.seconds_to_time_str(time_point)
-            # 计算这个章节的持续时间（到下一个章节开始）
             if i < len(chapters) - 1:
                 next_time = chapters[i + 1][0]
                 duration = next_time - time_point
@@ -143,7 +138,6 @@ def generate_chapter_file(entries, blocks, frame_rate, output_dir, video_name):
 
         chapter_path = Path(output_dir) / f"{video_name}.txt"
         chapter_gen.save_chapter_file(chapters, chapter_path)
-
         logging.info(f"章节文件已生成: {chapter_path}")
         return True
     else:
@@ -213,105 +207,63 @@ def main():
     logging.info(f"帧率: {frame_rate}")
 
     # 读取图片文件
-    image_files = sorted(
+    image_files = [
         f for f in os.listdir(input_folder)
         if f.lower().endswith(('.png'))
-    )
+    ]
     if not image_files:
         logging.error("在图片文件夹中未找到PNG文件")
         sys.exit(1)
 
     logging.info(f"找到 {len(image_files)} 个PNG文件")
 
-    flash_order_file = Path.cwd() / "_flash_order.txt"
-    ordered_characters = None
-    if flash_order_file.exists():
-        try:
-            with open(flash_order_file, 'r', encoding='utf-8-sig') as f:
-                text = f.read()
-            ordered_characters = [ch for ch in text if not ch.isspace()]
-            logging.info(f"检测到顺序文件，共 {len(ordered_characters)} 个字符")
-        except Exception as e:
-            logging.error(f"读取顺序文件失败: {e}")
-            ordered_characters = None
+    # 排序逻辑：先按码位，再按字体名（如果有）
+    def sort_key(filename):
+        match = re.search(r'U\+([0-9A-Fa-f]{4,6})', filename)
+        if not match:
+            return (0, filename)
+        code = int(match.group(1), 16)
+        base = filename.rsplit('.', 1)[0]
+        if '-' in base:
+            font_part = base.split('-')[-1]
+        else:
+            font_part = ''
+        return (code, font_part)
 
-    png_map = {}
+    image_files.sort(key=sort_key)
+
+    # 从文件名提取码位用于章节生成（去重）
+    entries = []
     for file_name in image_files:
-        match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', file_name)
+        match = re.search(r'U\+([0-9A-Fa-f]{4,6})', file_name)
         if match:
             code_str = f"U+{match.group(1).upper()}"
-            png_map[code_str] = file_name
+            entries.append(UnicodeEntry(
+                font_path=Path(""),
+                code_str=code_str,
+                description=""
+            ))
+        else:
+            logging.warning(f"无法从文件名提取码位：{file_name}，跳过")
 
-    if ordered_characters is not None:
-        sorted_image_files = []
-        for ch in ordered_characters:
-            cp = ord(ch)
-            code_str = f"U+{cp:04X}"
-            if code_str in png_map:
-                sorted_image_files.append(png_map[code_str])
-            else:
-                logging.warning(f"未找到字符 {ch} (U+{cp:04X}) 对应的PNG，已跳过")
-        logging.info(f"按顺序文件提取到 {len(sorted_image_files)} 张图片")
-        from Module import UnicodeEntry
-        entries = []
-        for ch in ordered_characters:
-            cp = ord(ch)
-            code_str = f"U+{cp:04X}"
-            if code_str in png_map:
-                entries.append(UnicodeEntry(
-                    font_path=Path(""),
-                    code_str=code_str,
-                    description=""
-                ))
-        logging.info(f"为章节生成构建 {len(entries)} 个条目")
-    else:
-        # 解析文件名获取Unicode值
-        valid_files = []
-        entries = []
-
-        for file_name in image_files:
-            try:
-                clean_name = file_name.lstrip('\ufeff')
-                match = re.search(r'_U\+([0-9A-Fa-f]+)\.png', clean_name)
-                if match:
-                    unicode_value = int(match.group(1), 16)
-                    valid_files.append((unicode_value, file_name))
-
-                    from Module import UnicodeEntry
-                    code_str = f"U+{match.group(1).upper()}"
-                    entries.append(UnicodeEntry(
-                        font_path=Path(""),
-                        code_str=code_str,
-                        description=""
-                    ))
-                else:
-                    logging.warning(f"警告：文件名格式不符合要求，跳过：{file_name}")
-            except ValueError as e:
-                logging.error(f"处理文件 {file_name} 时出错：{e}")
-
-        if not valid_files:
-            logging.warning("没有找到符合命名规则的PNG文件")
-            sys.exit(1)
-
-        # 按Unicode值排序
-        valid_files.sort(key=lambda x: x[0])
-        sorted_image_files = [f[1] for f in valid_files]
-
-        # 同时确保entries也是按相同顺序排序
-        entries.sort(key=lambda x: int(x.code_str[2:], 16))
-
-        logging.info(f"有效文件：{len(sorted_image_files)} 个")
+    # 使用普通字典去重并保持顺序
+    seen = set()
+    unique_entries = []
+    for e in entries:
+        if e.code_str not in seen:
+            seen.add(e.code_str)
+            unique_entries.append(e)
+    logging.info(f"从图片文件名提取到 {len(unique_entries)} 个唯一码位")
 
     # 生成视频
     output_file = os.path.join(output_dir, output_file_name + '.mp4')
-    ffmpeg_path = convert_images_to_video(input_folder, output_file, frame_rate, sorted_image_files)
+    ffmpeg_path = convert_images_to_video(input_folder, output_file, frame_rate, image_files)
 
     blocks_path = Path.cwd() / 'UnicodeBlocks.txt'
     if blocks_path.exists():
         blocks = load_unicode_blocks(blocks_path)
         logging.info(f"加载 {len(blocks)} 个 Unicode blocks")
-
-        generate_chapter_file(entries, blocks, frame_rate, output_dir, output_file_name)
+        generate_chapter_file(unique_entries, blocks, frame_rate, output_dir, output_file_name)
     else:
         logging.warning("UnicodeBlocks.txt 未找到，无法生成章节文件")
 
@@ -319,7 +271,6 @@ def main():
     add_music_choice = input("\n是否要为视频添加音乐? (y/n): ").strip().lower()
     if add_music_choice == 'y':
         music_file = cfg.music_file
-
         if os.path.exists(music_file):
             output_with_music = os.path.join(output_dir, output_file_name + '_music.mp4')
             if add_music_to_video(output_file, music_file, output_with_music, ffmpeg_path):
