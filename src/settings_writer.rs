@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
-static DEFAULT_MODULE_PY: &str = include_str!("../main/config.json");
+static DEFAULT_MODULE_PY: &str = include_str!("../main/scripts/config.json");
 
 fn restore_default_module() -> io::Result<()> {
     let out_path = Path::new("config.json");
