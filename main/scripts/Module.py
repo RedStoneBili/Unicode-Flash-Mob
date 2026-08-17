@@ -8,7 +8,7 @@ from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List
+from typing import List, Tuple, Optional, Any, Dict
 import os
 
 # 导入新创建的模块
@@ -44,59 +44,114 @@ from chapter_generator import ChapterGenerator, create_chapters_from_blocks
 
 @dataclass
 class Config:
-    unicode_file: Path = Path.cwd() / 'Unicode.txt'
-    output_dir: Path = Path.cwd() / 'png'
-    font_files: list[Path] = None
-    ctrl_font_file: Path = Path('Ctrl-Ctrl.ttf')
-    bottom_font_file: Path = Path.cwd() / 'PressStartHan2P.ttf'
-    music_file: Path = Path.cwd() / 'DUTM.m4a'
-    middle_font_size: int = 512
-    bottom_font_size: int = 16
-    text_position: tuple[int, int] = (0, 0)  # (text_position_x, text_position_y)
-    middle_font_color: tuple[int, int, int, int] = (20, 20, 20, 175)
-    image_size: tuple[int, int] = (1920, 1080)
-    background_color: tuple[int, int, int, int] = (0, 0, 0, 255)
-    color_cycle: list[tuple[int, int, int, int]] = None
+    """从 JSON 文件加载配置，提供默认值作为后备"""
+    def __init__(self, config_path: Optional[Path] = None):
+        self._data = self._default_config()
+        if config_path and config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                user_data = json.load(f)
+                self._data.update(user_data)
+        self._post_init()
 
-    png_compress_level: int = 2
-    png_optimize: bool = False
+    def _default_config(self) -> Dict:
+        return {
+            "unicode_file": "Unicode.txt",
+            "font_files": ["font.ttf"],
+            "ctrl_font_file": "Ctrl-Ctrl.ttf",
+            "bottom_font_file": "PressStartHan2P.ttf",
+            "music_file": "DUTM.m4a",
+            "blocks_file": "UnicodeBlocks.txt",
+            "output_dir": "png",
+            "middle_font_size": 512,
+            "bottom_font_size": 16,
+            "text_position": [0, 0],
+            "middle_font_color": [20, 20, 20, 175],
+            "image_size": [1920, 1080],
+            "background_color": [0, 0, 0, 255],
+            "color_cycle": [
+                "#ABDF56FF", "#6DE74EFF", "#68F59FFF", "#00BE9DFF", "#00CB81FF",
+                "#A8FD9AFF", "#99FEA9FF", "#98FCCAFF", "#98FEEBFF", "#97ECFDFF",
+                "#33E2FDFF", "#34B5DFFF", "#0095E0FF", "#CD9BFFFF", "#AB9BFFFF",
+                "#EE9AFFEF", "#FF9AF0FF", "#FE9ACCFF", "#FF9AAAFF", "#FCAB9AFF",
+                "#FBC99AFF", "#FDEE99FF", "#EEFE99FF", "#CFFF9BFF"
+            ],
+            "png_compress_level": 2,
+            "png_optimize": False,
+            "dynamic_bg": False,
+            "random_color": False,
+            "rainbow_gradient": False,
+            "gradient_colors": "",
+            "gradient_cycle": 100,
+            "smooth_gradient": True,
+            "flash_color": "",
+            "animate_elements": [],
+            "animation_type": "smooth",
+            "animation_amplitude": 50,
+            "animation_speed": 1.0,
+            "movement_speed": 0.1,
+            "content_position": "center",
+            "offset_x": 0,
+            "offset_y": 0,
+            "shuffle_content": False,
+            "show_names_info": False,
+            "show_encoding": False,
+            "show_block_position": False,
+            "show_global_position": False,
+            "show_block_progress_bar": False,
+            "show_global_progress_bar": False,
+            "show_side_spinner": False,
+            "spinner_strings": "-,\\,|,/",
+            "spinner_step_interval": 1,
+            "scale": 1.0,
+            "workers": 4,
+            "disable_comb_overlay": False,
+            "frame_rate": 30.0,
+            "video_name": "output",
+            "add_music": False,
+            "generate_chapters": True,
+            "chapter_template": "{block_name}"
+        }
 
-    def __post_init__(self):
-        if self.font_files is None:
-            self.font_files = [Path.cwd() / 'font.ttf']
-
-        if self.color_cycle is None:
-            hex_cycle = [
-                "#ABDF56FF", "#6DE74EFF", "#68F59FFF",
-                "#00BE9DFF", "#00CB81FF", "#A8FD9AFF",
-                "#99FEA9FF", "#98FCCAFF", "#98FEEBFF",
-                "#97ECFDFF", "#33E2FDFF", "#34B5DFFF",
-                "#0095E0FF", "#CD9BFFFF", "#A"
-                                          "B9BFFFF",
-                "#EE9AFFEF", "#FF9AF0FF", "#FE9ACCFF",
-                "#FF9AAAFF", "#FCAB9AFF", "#FBC99AFF",
-                "#FDEE99FF", "#EEFE99FF", "#CFFF9BFF",
-            ]
-            self.color_cycle = [self._hex_to_rgba_fast(h) for h in hex_cycle]
+    def _post_init(self):
+        # 转换路径
+        for key in ["unicode_file", "ctrl_font_file", "bottom_font_file", "music_file", "blocks_file", "output_dir"]:
+            if key in self._data:
+                self._data[key] = Path(self._data[key])
+        # 转换颜色循环为 RGBA 元组，使用 _hex_to_rgba_fast
+        self._data["color_cycle_rgba"] = [self._hex_to_rgba_fast(c) for c in self._data.get("color_cycle", [])]
+        # 确保其他类型正确
+        if isinstance(self._data.get("text_position"), list):
+            self._data["text_position"] = tuple(self._data["text_position"])
+        if isinstance(self._data.get("middle_font_color"), list):
+            self._data["middle_font_color"] = tuple(self._data["middle_font_color"])
+        if isinstance(self._data.get("image_size"), list):
+            self._data["image_size"] = tuple(self._data["image_size"])
+        if isinstance(self._data.get("background_color"), list):
+            self._data["background_color"] = tuple(self._data["background_color"])
 
     @staticmethod
-    @lru_cache(maxsize=128)
-    def _hex_to_rgba_fast(s: str) -> tuple[int, int, int, int]:
-        """优化的hex转RGBA，使用缓存避免重复计算"""
+    def _hex_to_rgba(s: str) -> Tuple[int, int, int, int]:
         s = s.lstrip('#')
         if len(s) == 6:
-            s = s + 'FF'
+            s += 'FF'
         if len(s) != 8:
-            raise ValueError(f"Invalid hex color: {s!r}")
-        return (
-            int(s[0:2], 16),
-            int(s[2:4], 16),
-            int(s[4:6], 16),
-            int(s[6:8], 16)
-        )
+            raise ValueError(f"Invalid hex color: {s}")
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), int(s[6:8], 16))
 
-    def _hex_to_rgba(self, s: str) -> tuple[int, int, int, int]:
-        return self._hex_to_rgba_fast(s)
+    # 别名，保持与原有代码兼容（原有 Config 类中有 _hex_to_rgba_fast）
+    _hex_to_rgba_fast = _hex_to_rgba
+
+    def __getattr__(self, name):
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(f"Config has no attribute '{name}'")
+
+    def update(self, args: Dict):
+        """用命令行参数更新配置"""
+        for key, value in args.items():
+            if value is not None and key in self._data:
+                self._data[key] = value
+        self._post_init()
 
 
 @dataclass
@@ -104,12 +159,17 @@ class UnicodeEntry:
     font_path: str
     code_str: str
     description: str
-    
+
     def get_font_paths(self) -> List[str]:
-        return self.font_path.split('|')
-    
+        if ':' in self.font_path:
+            return self.font_path.split(':')
+        elif '|' in self.font_path:
+            return self.font_path.split('|')
+        else:
+            return [self.font_path]
+
     def has_multiple_fonts(self) -> bool:
-        return '|' in self.font_path
+        return ':' in self.font_path or '|' in self.font_path
 
 
 
@@ -375,3 +435,6 @@ def blend_colors(fg: tuple[int, int, int], bg: tuple[int, int, int], alpha: floa
     )
 
 
+def load_config(config_path: Path = Path("config.json")) -> Config:
+    """便捷加载配置函数"""
+    return Config(config_path)

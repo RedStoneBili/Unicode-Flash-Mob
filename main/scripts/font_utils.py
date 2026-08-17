@@ -9,9 +9,15 @@ from PIL import ImageFont
 
 
 def preload_middle_fonts(entries, cfg) -> tuple[dict, dict]:
-    """预加载字体和度量信息"""
-    paths = {entry.font_path for entry in entries}
-    paths.update(cfg.font_files)
+    """预加载字体和度量信息，处理多字体路径"""
+    paths = set()
+    for entry in entries:
+        # 使用 get_font_paths 方法提取所有字体路径
+        if hasattr(entry, 'get_font_paths'):
+            paths.update(entry.get_font_paths())
+        else:
+            paths.add(entry.font_path)
+    paths.update(cfg.font_files)  # 添加配置中的备用字体
 
     font_cache: dict[Path, ImageFont.FreeTypeFont | None] = {}
     metrics_cache: dict[Path, tuple[int, int]] = {}
